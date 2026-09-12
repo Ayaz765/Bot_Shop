@@ -9,3 +9,6 @@ real_bills/
 
 # regenerate with: python make_sample_invoice.py --messy --seed N
 messy_samples/
+
+# photos shopkeepers send the bot
+bot_uploads/

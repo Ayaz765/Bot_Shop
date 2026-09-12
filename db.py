@@ -1,8 +1,14 @@
 """SQLite storage: past invoices, per-item rate history, running mismatch totals."""
 
+import difflib
 import sqlite3
 
 DB_PATH = "billcheck.db"
+NAME_MATCH_CUTOFF = 0.8  # how close an item name must be to count as "the same item"
+
+
+def _normalize(name):
+    return " ".join(name.lower().split())
 
 
 def get_connection(db_path=DB_PATH):
@@ -59,7 +65,27 @@ def is_duplicate(conn, supplier_name, invoice_number):
 
 
 def get_rate_history(conn, supplier_name, item_name):
-    """Past rates charged by this supplier for this item, oldest first."""
+    """Past rates charged by this supplier for this item, oldest first.
+
+    Matches item names fuzzily (case/spacing-insensitive) since the same
+    product can come out of extraction slightly differently each time
+    ("Tata Salt 1Kg" vs "TATA SALT 1 KG").
+    """
+    known_names = [
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT li.item_name FROM line_items li "
+            "JOIN invoices i ON i.id = li.invoice_id WHERE i.supplier_name = ?",
+            (supplier_name,),
+        ).fetchall()
+    ]
+    normalized_to_actual = {_normalize(name): name for name in known_names}
+    match = difflib.get_close_matches(
+        _normalize(item_name), normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF
+    )
+    if not match:
+        return []
+    matched_name = normalized_to_actual[match[0]]
+
     rows = conn.execute(
         """
         SELECT li.rate
@@ -68,7 +94,7 @@ def get_rate_history(conn, supplier_name, item_name):
         WHERE i.supplier_name = ? AND li.item_name = ?
         ORDER BY i.id ASC
         """,
-        (supplier_name, item_name),
+        (supplier_name, matched_name),
     ).fetchall()
     return [r[0] for r in rows]
 
