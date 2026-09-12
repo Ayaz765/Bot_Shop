@@ -18,7 +18,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
 
 GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"  # alias, auto-updates as Google retires older models
 
 DEFAULT_MODELS = {"anthropic": DEFAULT_ANTHROPIC_MODEL, "gemini": DEFAULT_GEMINI_MODEL}
 
