@@ -15,7 +15,12 @@ import requests
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
+
+GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+DEFAULT_MODELS = {"anthropic": DEFAULT_ANTHROPIC_MODEL, "gemini": DEFAULT_GEMINI_MODEL}
 
 SYSTEM_PROMPT = """You are reading a photo of a paper invoice from a small Indian shop supplier \
 (kirana, hardware, electrical, or pharmacy wholesaler). Extract exactly what is printed.
@@ -82,32 +87,47 @@ def _media_type(image_path):
             ".webp": "image/webp"}.get(ext, "image/jpeg")
 
 
-def _api_key():
-    key = os.environ.get("ANTHROPIC_API_KEY")
+def _api_key(env_var, hint):
+    key = os.environ.get(env_var)
     if not key:
-        sys.exit("ANTHROPIC_API_KEY not set. export ANTHROPIC_API_KEY=sk-ant-...")
+        sys.exit(f"{env_var} not set. export {env_var}={hint}")
     return key
 
 
-def list_models():
-    resp = requests.get(
-        ANTHROPIC_MODELS_URL,
-        headers={"x-api-key": _api_key(), "anthropic-version": ANTHROPIC_VERSION},
-    )
-    resp.raise_for_status()
-    for model in resp.json().get("data", []):
-        print(model["id"])
+def _parse_json_response(text):
+    """Vision models sometimes wrap JSON in ```json fences despite being told not to."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        text = text.removeprefix("json").strip()
+    return json.loads(text)
 
 
-def extract_invoice(image_path, model=DEFAULT_MODEL):
-    """Real vision call. Returns the parsed invoice dict."""
+def list_models(provider="anthropic"):
+    if provider == "gemini":
+        key = _api_key("GEMINI_API_KEY", "AIza...")
+        resp = requests.get(f"{GEMINI_API_ROOT}/models", params={"key": key})
+        resp.raise_for_status()
+        for model in resp.json().get("models", []):
+            print(model["name"])
+    else:
+        resp = requests.get(
+            ANTHROPIC_MODELS_URL,
+            headers={"x-api-key": _api_key("ANTHROPIC_API_KEY", "sk-ant-..."), "anthropic-version": ANTHROPIC_VERSION},
+        )
+        resp.raise_for_status()
+        for model in resp.json().get("data", []):
+            print(model["id"])
+
+
+def extract_invoice_anthropic(image_path, model):
     with open(image_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     resp = requests.post(
         ANTHROPIC_API_URL,
         headers={
-            "x-api-key": _api_key(),
+            "x-api-key": _api_key("ANTHROPIC_API_KEY", "sk-ant-..."),
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         },
@@ -129,14 +149,43 @@ def extract_invoice(image_path, model=DEFAULT_MODEL):
         },
     )
     resp.raise_for_status()
-    text = resp.json()["content"][0]["text"].strip()
-    return json.loads(text)
+    return _parse_json_response(resp.json()["content"][0]["text"])
 
 
-def extract(image_path, mock=False, all_ok=False, model=DEFAULT_MODEL):
+def extract_invoice_gemini(image_path, model):
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    key = _api_key("GEMINI_API_KEY", "AIza...")
+    resp = requests.post(
+        f"{GEMINI_API_ROOT}/models/{model}:generateContent",
+        params={"key": key},
+        json={
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": _media_type(image_path), "data": image_b64}},
+                    {"text": "Extract this invoice as JSON."},
+                ],
+            }],
+        },
+    )
+    resp.raise_for_status()
+    return _parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+
+def extract_invoice(image_path, provider="anthropic", model=None):
+    """Real vision call. Returns the parsed invoice dict."""
+    model = model or DEFAULT_MODELS[provider]
+    if provider == "gemini":
+        return extract_invoice_gemini(image_path, model)
+    return extract_invoice_anthropic(image_path, model)
+
+
+def extract(image_path, mock=False, all_ok=False, provider="anthropic", model=None):
     if mock:
         return MOCK_ALL_OK_INVOICE if all_ok else MOCK_INVOICE
-    return extract_invoice(image_path, model=model)
+    return extract_invoice(image_path, provider=provider, model=model)
 
 
 if __name__ == "__main__":
@@ -144,16 +193,17 @@ if __name__ == "__main__":
     parser.add_argument("image", nargs="?", help="Path to the invoice photo")
     parser.add_argument("--mock", action="store_true", help="Skip the API, return fixed test JSON")
     parser.add_argument("--all-ok", action="store_true", help="With --mock, return a JSON with no arithmetic trap")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--provider", choices=["anthropic", "gemini"], default="anthropic")
+    parser.add_argument("--model", default=None, help="Defaults to the provider's standard model")
     parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     args = parser.parse_args()
 
     if args.list_models:
-        list_models()
+        list_models(provider=args.provider)
         sys.exit(0)
 
     if not args.image:
         parser.error("image path is required unless --list-models is given")
 
-    invoice = extract(args.image, mock=args.mock, all_ok=args.all_ok, model=args.model)
+    invoice = extract(args.image, mock=args.mock, all_ok=args.all_ok, provider=args.provider, model=args.model)
     print(json.dumps(invoice, indent=2))

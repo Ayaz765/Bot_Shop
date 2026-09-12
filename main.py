@@ -42,12 +42,14 @@ def main():
     parser.add_argument("image", help="Path to the invoice photo")
     parser.add_argument("--mock", action="store_true", help="Skip the API, use fixed test JSON")
     parser.add_argument("--all-ok", action="store_true", help="With --mock, use a bill with no arithmetic trap")
+    parser.add_argument("--provider", choices=["anthropic", "gemini"], default="anthropic", help="Vision API to use for real extraction")
+    parser.add_argument("--model", default=None, help="Defaults to the provider's standard model")
     parser.add_argument("--received", default="", help='Items that differ from the bill, e.g. "1:94, 3:10"')
     parser.add_argument("--json", action="store_true", help="Print raw issues as JSON instead of the report")
     parser.add_argument("--no-save", action="store_true", help="Don't save this invoice to the database")
     args = parser.parse_args()
 
-    invoice = extract.extract(args.image, mock=args.mock, all_ok=args.all_ok)
+    invoice = extract.extract(args.image, mock=args.mock, all_ok=args.all_ok, provider=args.provider, model=args.model)
     received_qty = parse_received(args.received)
 
     conn = db.get_connection()
