@@ -6,3 +6,6 @@ __pycache__/
 # real supplier data — large, third-party, not for version control
 *.pdf
 real_bills/
+
+# regenerate with: python make_sample_invoice.py --messy --seed N
+messy_samples/

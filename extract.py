@@ -24,9 +24,12 @@ Rules:
 1. Copy every number EXACTLY as printed, even if the arithmetic looks wrong. If a line says
    12 x 132 = 1684, output amount 1684 — do NOT correct it to 1584. Catching supplier math
    errors is the entire point of this tool; a "helpful" correction destroys that.
-2. If a field is unreadable (torn, blurry, handwriting you can't parse), set it to null and
+2. The photo may be tilted. Match each row's qty/rate/amount to its item name by READING
+   ORDER (1st item goes with the 1st qty/rate/amount, 2nd with 2nd, ...), never by vertical
+   pixel position — tilt shifts numbers up or down relative to the item names next to them.
+3. If a field is unreadable (torn, blurry, handwriting you can't parse), set it to null and
    add its name to unreadable_fields. Never guess a number to fill a gap.
-3. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
+4. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
 
 {
   "supplier_name": string or null,
