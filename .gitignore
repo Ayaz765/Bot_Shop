@@ -1,0 +1,8 @@
+venv/
+*.db
+__pycache__/
+.env
+
+# real supplier data — large, third-party, not for version control
+*.pdf
+real_bills/
