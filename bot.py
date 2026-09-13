@@ -12,6 +12,7 @@ re-saved. Good enough for testing; revisit if this becomes the real product.
 import html
 import os
 import sys
+import time
 from datetime import datetime
 
 import requests
@@ -216,7 +217,8 @@ def main():
                 offset = update["update_id"] + 1
                 handle_update(update)
         except requests.exceptions.RequestException as e:
-            print(f"Network hiccup, retrying: {e}", flush=True)
+            print(f"Network hiccup, retrying in 5s: {e}", flush=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
