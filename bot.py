@@ -28,7 +28,12 @@ FILE_ROOT = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 
 BOT_NAME = "LUMO"
-WELCOME = "Bill ki photo bhejo, main check karke bataunga kitna paisa phansa hai."
+WELCOME = (
+    "Aap 3 tarike se bata sakte ho:\n\n"
+    "📷 Photo bhejunga — bill ki photo bhejo, main padh ke check karunga kitna paisa phansa hai\n"
+    "🏪 Vendor ka naam batau — pehle vendor ka naam bata do (jaise Ayaz), phir uski invoice ki photo bhejo\n"
+    "✍️ Bina photo ke likhunga — koi bill nahi hai to type karke batao kya-kya aaya"
+)
 
 pending = {}  # chat_id -> last extracted invoice, so a follow-up text can re-check it
 user_names = {}  # chat_id -> name, once they've told us
