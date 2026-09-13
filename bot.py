@@ -34,6 +34,25 @@ pending = {}  # chat_id -> last extracted invoice, so a follow-up text can re-ch
 user_names = {}  # chat_id -> name, once they've told us
 awaiting_name = set()  # chat_id currently expected to reply with their name
 pending_photo = {}  # chat_id -> downloaded image path, if a photo arrived before we had a name
+vendor_override = {}  # chat_id -> vendor name to force onto invoices, set via /vendor
+awaiting_manual_entry = set()  # chat_id currently expected to describe a delivery in text
+
+MANUAL_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar bina bill ki photo ke bata raha hai ki supplier se \
+kya maal aaya. Jo bhi items, quantity aur rate usne bataye hain unhe isi JSON shape mein nikaalo:
+
+{
+  "supplier_name": string or null,
+  "invoice_number": null,
+  "invoice_date": null,
+  "items": [{"name": string, "qty": number, "rate": number or null, "amount": number or null}],
+  "sub_total": null,
+  "tax": null,
+  "grand_total": null,
+  "confidence": 1.0,
+  "unreadable_fields": []
+}
+
+Rate na bataya gaya ho to null rakho (amount bhi null). Sirf JSON do, kuch aur text nahi."""
 
 NOT_A_NAME = {
     "hi", "hii", "hiii", "hiiii", "hello", "hey", "hey lumo", "hii lumo",
@@ -114,6 +133,21 @@ def casual_reply(chat_id, text):
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
+def extract_from_text(text):
+    """Manual entry: same invoice JSON shape as extract.py, but parsed from typed text."""
+    key = os.environ.get("GEMINI_API_KEY")
+    resp = requests.post(
+        f"{extract.GEMINI_API_ROOT}/models/{extract.DEFAULT_GEMINI_MODEL}:generateContent",
+        params={"key": key},
+        json={
+            "system_instruction": {"parts": [{"text": MANUAL_ENTRY_SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": text}]}],
+        },
+    )
+    resp.raise_for_status()
+    return extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+
 def download_photo(file_id, dest_path):
     file_info = requests.get(f"{API_ROOT}/getFile", params={"file_id": file_id}).json()["result"]
     data = requests.get(f"{FILE_ROOT}/{file_info['file_path']}").content
@@ -121,24 +155,43 @@ def download_photo(file_id, dest_path):
         f.write(data)
 
 
+def process_invoice_data(chat_id, invoice):
+    """Shared by photo and manual-entry paths, once we have an invoice dict."""
+    if chat_id in vendor_override:
+        invoice["supplier_name"] = vendor_override[chat_id]
+
+    conn = db.get_connection()
+    issues = checker.check_invoice(conn, invoice, received_qty={})
+    db.save_invoice(
+        conn, invoice.get("supplier_name"), invoice.get("invoice_number"),
+        invoice.get("invoice_date"), invoice.get("grand_total"),
+        invoice.get("items", []), issues,
+    )
+    pending[chat_id] = invoice
+    send_message(chat_id, format_report_html(invoice, issues), parse_mode="HTML")
+    send_message(chat_id, format_correction_prompt(invoice), parse_mode="HTML")
+
+
 def process_photo(chat_id, image_path):
     send_message(chat_id, f"{user_names[chat_id]}, bill padh raha hoon...")
     try:
         invoice = extract.extract(image_path, provider=PROVIDER)
-        conn = db.get_connection()
-        issues = checker.check_invoice(conn, invoice, received_qty={})
-        db.save_invoice(
-            conn, invoice.get("supplier_name"), invoice.get("invoice_number"),
-            invoice.get("invoice_date"), invoice.get("grand_total"),
-            invoice.get("items", []), issues,
-        )
-        pending[chat_id] = invoice
-        send_message(chat_id, format_report_html(invoice, issues), parse_mode="HTML")
-        send_message(chat_id, format_correction_prompt(invoice), parse_mode="HTML")
+        process_invoice_data(chat_id, invoice)
     except Exception as e:
         import traceback
         traceback.print_exc()
         send_message(chat_id, f"Padhne mein dikkat aayi: {e}")
+
+
+def process_manual_entry(chat_id, text):
+    send_message(chat_id, f"{user_names[chat_id]}, samajh raha hoon...")
+    try:
+        invoice = extract_from_text(text)
+        process_invoice_data(chat_id, invoice)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        send_message(chat_id, f"Samajh nahi paya: {e}")
 
 
 def process_correction(chat_id, text):
@@ -193,11 +246,30 @@ def handle_update(update):
         process_photo(chat_id, save_incoming_photo(message))
 
     elif "text" in message:
-        if chat_id in pending:
-            process_correction(chat_id, message["text"])
+        text = message["text"].strip()
+
+        if text.lower().startswith("/vendor"):
+            name = text[len("/vendor"):].strip()
+            if not name:
+                send_message(chat_id, "Vendor ka naam bhi likho, jaise: /vendor Ayaz")
+            else:
+                vendor_override[chat_id] = name
+                send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {name} ke maane jayenge.")
+
+        elif text.lower() == "/manual":
+            awaiting_manual_entry.add(chat_id)
+            send_message(chat_id, 'Bina photo ke batao kya aaya, jaise: "5 Biscuit @10, 6 Maggi @132"')
+
+        elif chat_id in awaiting_manual_entry:
+            awaiting_manual_entry.discard(chat_id)
+            process_manual_entry(chat_id, text)
+
+        elif chat_id in pending:
+            process_correction(chat_id, text)
+
         else:
             try:
-                send_message(chat_id, casual_reply(chat_id, message["text"]))
+                send_message(chat_id, casual_reply(chat_id, text))
             except Exception:
                 send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}")
 
