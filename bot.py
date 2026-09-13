@@ -29,10 +29,11 @@ PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 
 BOT_NAME = "LUMO"
 WELCOME = (
-    "Aap 3 tarike se bata sakte ho:\n\n"
-    "📷 Photo bhejunga — bill ki photo bhejo, main padh ke check karunga kitna paisa phansa hai\n"
-    "🏪 Vendor ka naam batau — pehle vendor ka naam bata do (jaise Ayaz), phir uski invoice ki photo bhejo\n"
-    "✍️ Bina photo ke likhunga — koi bill nahi hai to type karke batao kya-kya aaya"
+    "Teen tareeke se bata sakte ho:\n\n"
+    "📷 Photo — bill kheech ke bhejo, main check kar dunga kitna paisa phansa hai\n"
+    "🏪 Vendor bata ke — pehle vendor ka naam bolo (jaise Ayaz), fir uski bill ki photo bhejo\n"
+    "✍️ Bina photo — type karke batao kya-kya aaya, price ke saath\n\n"
+    "Aur kabhi bhi \"purana hisaab\" dabake dekh sakte ho kisi vendor se ab tak kya-kya aaya."
 )
 
 pending = {}  # chat_id -> last extracted invoice, so a follow-up text can re-check it
@@ -42,13 +43,15 @@ pending_photo = {}  # chat_id -> downloaded image path, if a photo arrived befor
 vendor_override = {}  # chat_id -> vendor name to force onto invoices, set via /vendor
 awaiting_manual_entry = set()  # chat_id currently expected to describe a delivery in text
 awaiting_vendor_name = set()  # chat_id currently expected to reply with a vendor name
+awaiting_history_vendor = set()  # chat_id currently expected to name a vendor to look up
 
 BTN_PHOTO = "📷 Photo bhejunga"
 BTN_VENDOR = "🏪 Vendor ka naam batau"
 BTN_MANUAL = "✍️ Bina photo ke likhunga"
+BTN_HISTORY = "📜 Purana hisaab"
 
 MAIN_MENU = {
-    "keyboard": [[BTN_PHOTO], [BTN_VENDOR], [BTN_MANUAL]],
+    "keyboard": [[BTN_PHOTO], [BTN_VENDOR], [BTN_MANUAL], [BTN_HISTORY]],
     "resize_keyboard": True,
 }
 
@@ -125,6 +128,25 @@ def format_correction_prompt(invoice):
         "Ek se zyada cheez mein farak ho to comma se: <code>1:94, 3:10</code>\n\n"
         "Sab kuch bill jitna hi mila? Kuch bhejne ki zarurat nahi hai."
     )
+
+
+def format_vendor_history(vendor_name, invoices):
+    if not invoices:
+        return f"<b>{html.escape(vendor_name)}</b> se abhi tak koi bill nahi mila mere paas."
+
+    lines = [f"<b>{html.escape(vendor_name)} — pichle {len(invoices)} bill</b>", ""]
+    total_loss = 0.0
+    for inv in invoices:
+        num = inv["invoice_number"] or "(number nahi)"
+        date = inv["invoice_date"] or ""
+        loss = inv["total_loss"] or 0.0
+        total_loss += loss
+        loss_note = f" — ⚠️ Rs{loss:.2f} phansa" if loss > 0 else ""
+        lines.append(f"• {html.escape(str(num))} {date}: Rs{inv['grand_total'] or 0:.2f}{loss_note}")
+
+    lines.append("")
+    lines.append(f"<b>💰 In sab mein total phansa: Rs{total_loss:.2f}</b>")
+    return "\n".join(lines)
 
 
 def casual_reply(chat_id, text):
@@ -270,7 +292,7 @@ def handle_update(update):
 
         elif text == BTN_VENDOR:
             awaiting_vendor_name.add(chat_id)
-            send_message(chat_id, "Vendor ka naam batao (jaise: Ayaz) — jab tak na badlo, saare bills usी ke maane jayenge.")
+            send_message(chat_id, "Vendor ka naam batao (jaise: Ayaz) — jab tak na badlo, saare bills usi ke maane jayenge.")
 
         elif text == BTN_MANUAL or text.lower() == "/manual":
             awaiting_manual_entry.add(chat_id)
@@ -288,6 +310,20 @@ def handle_update(update):
             awaiting_vendor_name.discard(chat_id)
             vendor_override[chat_id] = text
             send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {text} ke maane jayenge.", reply_markup=MAIN_MENU)
+
+        elif text == BTN_HISTORY:
+            awaiting_history_vendor.add(chat_id)
+            send_message(chat_id, "Kis vendor ka hisaab dekhna hai? Naam batao.")
+
+        elif chat_id in awaiting_history_vendor:
+            awaiting_history_vendor.discard(chat_id)
+            conn = db.get_connection()
+            matched = db.find_supplier(conn, text)
+            if not matched:
+                send_message(chat_id, f"{text} ka koi bill mere paas nahi hai abhi.", reply_markup=MAIN_MENU)
+            else:
+                invoices = db.get_invoices_for_supplier(conn, matched)
+                send_message(chat_id, format_vendor_history(matched, invoices), parse_mode="HTML", reply_markup=MAIN_MENU)
 
         elif chat_id in awaiting_manual_entry:
             awaiting_manual_entry.discard(chat_id)

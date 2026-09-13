@@ -53,6 +53,27 @@ def init_db(conn):
     conn.commit()
 
 
+def find_supplier(conn, name):
+    """Fuzzy-match a typed supplier name against ones already seen. None if no match."""
+    known = [row[0] for row in conn.execute("SELECT DISTINCT supplier_name FROM invoices").fetchall()]
+    normalized_to_actual = {_normalize(n): n for n in known}
+    match = difflib.get_close_matches(_normalize(name), normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF)
+    return normalized_to_actual[match[0]] if match else None
+
+
+def get_invoices_for_supplier(conn, supplier_name, limit=10):
+    """Most recent invoices for one supplier, newest first."""
+    rows = conn.execute(
+        "SELECT invoice_number, invoice_date, grand_total, total_loss FROM invoices "
+        "WHERE supplier_name = ? ORDER BY id DESC LIMIT ?",
+        (supplier_name, limit),
+    ).fetchall()
+    return [
+        {"invoice_number": r[0], "invoice_date": r[1], "grand_total": r[2], "total_loss": r[3]}
+        for r in rows
+    ]
+
+
 def is_duplicate(conn, supplier_name, invoice_number):
     """Return the earlier invoice id if this supplier+invoice_number was seen before, else None."""
     if not invoice_number:
