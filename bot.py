@@ -36,6 +36,16 @@ awaiting_name = set()  # chat_id currently expected to reply with their name
 pending_photo = {}  # chat_id -> downloaded image path, if a photo arrived before we had a name
 vendor_override = {}  # chat_id -> vendor name to force onto invoices, set via /vendor
 awaiting_manual_entry = set()  # chat_id currently expected to describe a delivery in text
+awaiting_vendor_name = set()  # chat_id currently expected to reply with a vendor name
+
+BTN_PHOTO = "📷 Photo bhejunga"
+BTN_VENDOR = "🏪 Vendor ka naam batau"
+BTN_MANUAL = "✍️ Bina photo ke likhunga"
+
+MAIN_MENU = {
+    "keyboard": [[BTN_PHOTO], [BTN_VENDOR], [BTN_MANUAL]],
+    "resize_keyboard": True,
+}
 
 MANUAL_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar bina bill ki photo ke bata raha hai ki supplier se \
 kya maal aaya. Jo bhi items, quantity aur rate usne bataye hain unhe isi JSON shape mein nikaalo:
@@ -69,10 +79,12 @@ def time_greeting():
     return "Good evening"
 
 
-def send_message(chat_id, text, parse_mode=None):
+def send_message(chat_id, text, parse_mode=None, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     requests.post(f"{API_ROOT}/sendMessage", json=payload)
 
 
@@ -231,7 +243,7 @@ def handle_update(update):
                 return
             user_names[chat_id] = name
             awaiting_name.discard(chat_id)
-            send_message(chat_id, f"Dhanyawad, {name}! {WELCOME}")
+            send_message(chat_id, f"Dhanyawad, {name}! {WELCOME}", reply_markup=MAIN_MENU)
             if chat_id in pending_photo:
                 process_photo(chat_id, pending_photo.pop(chat_id))
             return
@@ -248,7 +260,18 @@ def handle_update(update):
     elif "text" in message:
         text = message["text"].strip()
 
-        if text.lower().startswith("/vendor"):
+        if text == BTN_PHOTO:
+            send_message(chat_id, "Theek hai, bill ki photo bhej do jab ready ho.")
+
+        elif text == BTN_VENDOR:
+            awaiting_vendor_name.add(chat_id)
+            send_message(chat_id, "Vendor ka naam batao (jaise: Ayaz) — jab tak na badlo, saare bills usी ke maane jayenge.")
+
+        elif text == BTN_MANUAL or text.lower() == "/manual":
+            awaiting_manual_entry.add(chat_id)
+            send_message(chat_id, 'Bina photo ke batao kya aaya, jaise: "5 Biscuit @10, 6 Maggi @132"')
+
+        elif text.lower().startswith("/vendor"):
             name = text[len("/vendor"):].strip()
             if not name:
                 send_message(chat_id, "Vendor ka naam bhi likho, jaise: /vendor Ayaz")
@@ -256,9 +279,10 @@ def handle_update(update):
                 vendor_override[chat_id] = name
                 send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {name} ke maane jayenge.")
 
-        elif text.lower() == "/manual":
-            awaiting_manual_entry.add(chat_id)
-            send_message(chat_id, 'Bina photo ke batao kya aaya, jaise: "5 Biscuit @10, 6 Maggi @132"')
+        elif chat_id in awaiting_vendor_name:
+            awaiting_vendor_name.discard(chat_id)
+            vendor_override[chat_id] = text
+            send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {text} ke maane jayenge.", reply_markup=MAIN_MENU)
 
         elif chat_id in awaiting_manual_entry:
             awaiting_manual_entry.discard(chat_id)
@@ -269,9 +293,9 @@ def handle_update(update):
 
         else:
             try:
-                send_message(chat_id, casual_reply(chat_id, text))
+                send_message(chat_id, casual_reply(chat_id, text), reply_markup=MAIN_MENU)
             except Exception:
-                send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}")
+                send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}", reply_markup=MAIN_MENU)
 
 
 def main():
