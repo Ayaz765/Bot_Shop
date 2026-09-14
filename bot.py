@@ -68,6 +68,9 @@ ALL_BUTTON_TEXTS = {
     BTN_SUMMARIZE, BTN_STOCK, BTN_STOCK_PHOTO, BTN_STOCK_MANUAL, BTN_YES, BTN_NO,
 }
 
+YES_WORDS = {"haan", "ha", "han", "yes", "y", "ok", "okay", "theek hai", "kar do", "add karo"}
+NO_WORDS = {"nahi", "nah", "no", "n", "cancel", "mat karo", "chhodo"}
+
 
 def clear_stock_flow(chat_id):
     """Drop any in-progress Add-to-Stock state for this chat — used when the user
@@ -230,8 +233,12 @@ def handle_sale(chat_id, items, vendor_name):
             vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, m["vendor_name"], m["item_name"], qty, unit)
             lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
         else:
-            vendors = ", ".join(html.escape(m["vendor_name"]) for m in matches)
-            lines.append(f"• {html.escape(name)}: kis vendor ka becha? ({vendors}) — phir se batao vendor ka naam le kar")
+            vendors = " / ".join(html.escape(m["vendor_name"]) for m in matches)
+            example = matches[0]["vendor_name"]
+            lines.append(
+                f"• {html.escape(name)}: {vendors} — dono ke paas hai, kis ka becha? "
+                f"Jaise likho: \"{example} ka {html.escape(name)} becha\""
+            )
 
     send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML", reply_markup=MAIN_MENU)
 
@@ -408,6 +415,9 @@ def handle_update(update):
         awaiting_stock_vendor.add(chat_id)
         send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.", reply_markup=NO_KEYBOARD)
 
+    elif chat_id in awaiting_stock_vendor and text in ALL_BUTTON_TEXTS:
+        send_message(chat_id, "Vendor ka naam likho (button nahi), jaise: Ayaz")
+
     elif chat_id in awaiting_stock_vendor:
         awaiting_stock_vendor.discard(chat_id)
         awaiting_stock_method[chat_id] = text
@@ -428,12 +438,15 @@ def handle_update(update):
         if process_stock_manual(chat_id, vendor_name, text):
             awaiting_stock_manual_text.pop(chat_id, None)
 
-    elif chat_id in pending_stock_confirmation and text == BTN_YES:
+    elif chat_id in pending_stock_confirmation and (text == BTN_YES or text.lower() in YES_WORDS):
         confirm_stock_addition(chat_id)
 
-    elif chat_id in pending_stock_confirmation and text == BTN_NO:
+    elif chat_id in pending_stock_confirmation and (text == BTN_NO or text.lower() in NO_WORDS):
         pending_stock_confirmation.pop(chat_id)
         send_message(chat_id, "Theek hai, cancel kar diya.", reply_markup=MAIN_MENU)
+
+    elif chat_id in pending_stock_confirmation:
+        send_message(chat_id, "Haan ya nahi bata do — stock mein add karna hai?", reply_markup=CONFIRM_MENU)
 
     else:
         try:
