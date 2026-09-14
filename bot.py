@@ -102,7 +102,12 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(f"{API_ROOT}/sendMessage", json=payload)
+    preview = text.replace("\n", " ")[:150]
+    resp = requests.post(f"{API_ROOT}/sendMessage", json=payload)
+    if resp.status_code != 200:
+        print(f"DEBUG send FAILED ({resp.status_code}) to {chat_id}: {resp.text[:300]} | tried to send: {preview}", flush=True)
+    else:
+        print(f"DEBUG sent to {chat_id}: {preview}", flush=True)
 
 
 def format_summary_html(invoice):
@@ -319,7 +324,7 @@ def confirm_stock_addition(chat_id):
 def handle_update(update):
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
-    print(f"DEBUG update: chat_id={chat_id} keys={list(message.keys())}", flush=True)
+    print(f"DEBUG update: chat_id={chat_id} keys={list(message.keys())} text={message.get('text')!r}", flush=True)
     if not chat_id:
         return
     if "text" not in message and "photo" not in message and "document" not in message:
