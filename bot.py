@@ -52,17 +52,29 @@ pending_stock_confirmation = {}  # chat_id -> {"vendor_name", "items"}, waiting 
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
-MAIN_MENU = {"keyboard": [[BTN_SUMMARIZE], [BTN_STOCK]], "resize_keyboard": True}
+MAIN_MENU = {"inline_keyboard": [
+    [{"text": BTN_SUMMARIZE, "callback_data": "summarize"}],
+    [{"text": BTN_STOCK, "callback_data": "stock"}],
+]}
 
 BTN_STOCK_PHOTO = "📸 Add from Image"
 BTN_STOCK_MANUAL = "✍️ Add Manually"
-STOCK_METHOD_MENU = {"keyboard": [[BTN_STOCK_PHOTO], [BTN_STOCK_MANUAL]], "resize_keyboard": True}
+STOCK_METHOD_MENU = {"inline_keyboard": [
+    [{"text": BTN_STOCK_PHOTO, "callback_data": "stock_photo"}],
+    [{"text": BTN_STOCK_MANUAL, "callback_data": "stock_manual"}],
+]}
 
 BTN_YES = "✅ Haan, add karo"
 BTN_NO = "❌ Nahi, cancel"
-CONFIRM_MENU = {"keyboard": [[BTN_YES], [BTN_NO]], "resize_keyboard": True}
+CONFIRM_MENU = {"inline_keyboard": [
+    [{"text": BTN_YES, "callback_data": "confirm_yes"}],
+    [{"text": BTN_NO, "callback_data": "confirm_no"}],
+]}
 
-NO_KEYBOARD = {"remove_keyboard": True}
+# Inline buttons attach to one message and never take over the keyboard area, so
+# there's nothing to "remove" the way a ReplyKeyboardMarkup panel needs — that panel
+# was the actual bug (stays open until the user manually taps back to their keyboard).
+NO_KEYBOARD = None
 
 ALL_BUTTON_TEXTS = {
     BTN_SUMMARIZE, BTN_STOCK, BTN_STOCK_PHOTO, BTN_STOCK_MANUAL, BTN_YES, BTN_NO,
@@ -131,6 +143,11 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         print(f"DEBUG send FAILED ({resp.status_code}) to {chat_id}: {resp.text[:300]} | tried to send: {preview}", flush=True)
     else:
         print(f"DEBUG sent to {chat_id}: {preview}", flush=True)
+
+
+def answer_callback(callback_query_id):
+    """Stops the tap's loading spinner on the user's inline button."""
+    requests.post(f"{API_ROOT}/answerCallbackQuery", json={"callback_query_id": callback_query_id})
 
 
 def format_summary_html(invoice):
@@ -357,6 +374,43 @@ def confirm_stock_addition(chat_id):
     send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
+def handle_callback_query(cq):
+    """Inline-button taps. Mirrors the equivalent text == BTN_X branches in
+    handle_update, but keyed off callback_data instead of typed text."""
+    answer_callback(cq["id"])
+    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+    data = cq.get("data", "")
+    print(f"DEBUG callback: chat_id={chat_id} data={data!r}", flush=True)
+    if not chat_id or chat_id not in user_names:
+        return  # menus only ever shown after onboarding
+
+    if data == "summarize":
+        clear_stock_flow(chat_id)
+        send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.")
+
+    elif data == "stock":
+        clear_stock_flow(chat_id)
+        awaiting_stock_vendor.add(chat_id)
+        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+
+    elif data == "stock_photo" and chat_id in awaiting_stock_method:
+        vendor_name = awaiting_stock_method.pop(chat_id)
+        awaiting_stock_photo[chat_id] = vendor_name
+        send_message(chat_id, "Theek hai, photo bhej do.")
+
+    elif data == "stock_manual" and chat_id in awaiting_stock_method:
+        vendor_name = awaiting_stock_method.pop(chat_id)
+        awaiting_stock_manual_text[chat_id] = vendor_name
+        send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"')
+
+    elif data == "confirm_yes" and chat_id in pending_stock_confirmation:
+        confirm_stock_addition(chat_id)
+
+    elif data == "confirm_no" and chat_id in pending_stock_confirmation:
+        pending_stock_confirmation.pop(chat_id, None)
+        send_message(chat_id, "Theek hai, cancel kar diya.", reply_markup=MAIN_MENU)
+
+
 def handle_update(update):
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
@@ -479,7 +533,10 @@ def main():
             updates = requests.get(f"{API_ROOT}/getUpdates", params=params, timeout=35).json()["result"]
             for update in updates:
                 offset = update["update_id"] + 1
-                handle_update(update)
+                if "callback_query" in update:
+                    handle_callback_query(update["callback_query"])
+                else:
+                    handle_update(update)
         except requests.exceptions.RequestException as e:
             print(f"Network hiccup, retrying in 5s: {e}", flush=True)
             time.sleep(5)
