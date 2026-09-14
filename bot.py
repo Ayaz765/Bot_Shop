@@ -64,6 +64,21 @@ CONFIRM_MENU = {"keyboard": [[BTN_YES], [BTN_NO]], "resize_keyboard": True}
 
 NO_KEYBOARD = {"remove_keyboard": True}
 
+ALL_BUTTON_TEXTS = {
+    BTN_SUMMARIZE, BTN_STOCK, BTN_STOCK_PHOTO, BTN_STOCK_MANUAL, BTN_YES, BTN_NO,
+}
+
+
+def clear_stock_flow(chat_id):
+    """Drop any in-progress Add-to-Stock state for this chat — used when the user
+    explicitly starts a fresh flow via the main menu, so a stray/late tap of an old
+    button doesn't silently overwrite progress (it resets it on purpose instead)."""
+    awaiting_stock_vendor.discard(chat_id)
+    awaiting_stock_method.pop(chat_id, None)
+    awaiting_stock_photo.pop(chat_id, None)
+    awaiting_stock_manual_text.pop(chat_id, None)
+    pending_stock_confirmation.pop(chat_id, None)
+
 STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
 aur kitni quantity mein aaye. Naam, quantity, aur unit (kg, litre, pcs, box, dozen, bag, etc.) \
 chahiye — rate ki zarurat nahi. Isi JSON shape mein nikaalo, sirf JSON do, kuch aur text nahi:
@@ -280,6 +295,9 @@ def process_summarize(chat_id, file_path):
 
 
 def process_stock_photo(chat_id, vendor_name, file_path):
+    """Returns True on success. False means the caller should let the user retry
+    (keep them in the same waiting-for-photo state) instead of dropping them back
+    to the main menu with no way to continue without starting the flow over."""
     send_message(chat_id, f"{user_names[chat_id]}, photo padh raha hoon...")
     try:
         invoice = extract.extract(file_path, provider=PROVIDER)
@@ -288,17 +306,21 @@ def process_stock_photo(chat_id, vendor_name, file_path):
             for i in invoice.get("items", []) if i.get("qty")
         ]
         if not items:
-            send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein.", reply_markup=MAIN_MENU)
-            return
+            send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein. Dusri photo try karo.")
+            return False
         pending_stock_confirmation[chat_id] = {"vendor_name": vendor_name, "items": items}
         send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+        return True
     except Exception:
         import traceback
         traceback.print_exc()
-        send_message(chat_id, "Padhne mein dikkat aayi, dobara try karo.", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Padhne mein dikkat aayi. Dusri photo try karo.")
+        return False
 
 
 def process_stock_manual(chat_id, vendor_name, text):
+    """Returns True on success, False if the caller should let the user retry
+    typing (same reasoning as process_stock_photo)."""
     send_message(chat_id, f"{user_names[chat_id]}, samajh raha hoon...")
     try:
         items = [
@@ -306,14 +328,16 @@ def process_stock_manual(chat_id, vendor_name, text):
             for i in extract_stock_items(text) if i.get("qty")
         ]
         if not items:
-            send_message(chat_id, "Koi item/quantity samajh nahi aayi.", reply_markup=MAIN_MENU)
-            return
+            send_message(chat_id, "Koi item/quantity samajh nahi aayi. Phir se batao, jaise: \"Biscuit 20 pcs\"")
+            return False
         pending_stock_confirmation[chat_id] = {"vendor_name": vendor_name, "items": items}
         send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+        return True
     except Exception:
         import traceback
         traceback.print_exc()
-        send_message(chat_id, "Samajh nahi paya, dobara try karo.", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Samajh nahi paya. Phir se try karo.")
+        return False
 
 
 def confirm_stock_addition(chat_id):
@@ -339,7 +363,7 @@ def handle_update(update):
     if chat_id not in user_names:
         if chat_id in awaiting_name and "text" in message:
             name = message["text"].strip()
-            if name.lower() in NOT_A_NAME:
+            if name.lower() in NOT_A_NAME or name in ALL_BUTTON_TEXTS:
                 send_message(chat_id, "Wo naam nahi laga 😅 Bas apna naam likho, jaise: Ramesh")
                 return
             user_names[chat_id] = name
@@ -366,8 +390,9 @@ def handle_update(update):
             send_message(chat_id, "Ye file PDF ya image nahi lagi.", reply_markup=MAIN_MENU)
             return
         if chat_id in awaiting_stock_photo:
-            vendor_name = awaiting_stock_photo.pop(chat_id)
-            process_stock_photo(chat_id, vendor_name, file_path)
+            vendor_name = awaiting_stock_photo[chat_id]
+            if process_stock_photo(chat_id, vendor_name, file_path):
+                awaiting_stock_photo.pop(chat_id, None)
         else:
             process_summarize(chat_id, file_path)
         return
@@ -375,9 +400,11 @@ def handle_update(update):
     text = message["text"].strip()
 
     if text == BTN_SUMMARIZE:
+        clear_stock_flow(chat_id)
         send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.", reply_markup=NO_KEYBOARD)
 
     elif text == BTN_STOCK:
+        clear_stock_flow(chat_id)
         awaiting_stock_vendor.add(chat_id)
         send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.", reply_markup=NO_KEYBOARD)
 
@@ -397,8 +424,9 @@ def handle_update(update):
         send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"', reply_markup=NO_KEYBOARD)
 
     elif chat_id in awaiting_stock_manual_text:
-        vendor_name = awaiting_stock_manual_text.pop(chat_id)
-        process_stock_manual(chat_id, vendor_name, text)
+        vendor_name = awaiting_stock_manual_text[chat_id]
+        if process_stock_manual(chat_id, vendor_name, text):
+            awaiting_stock_manual_text.pop(chat_id, None)
 
     elif chat_id in pending_stock_confirmation and text == BTN_YES:
         confirm_stock_addition(chat_id)
