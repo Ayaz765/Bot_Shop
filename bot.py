@@ -223,17 +223,17 @@ def format_stock_report(vendor_name, items):
 
 
 def handle_stock_query(ukey, vendor_name):
-    chat_id = ukey[0]
+    chat_id, owner_id = ukey
     if not vendor_name:
         send_message(chat_id, "Kaunse vendor ka stock dekhna hai?", reply_markup=MAIN_MENU)
         return
     conn = db.get_connection()
-    items = db.get_stock_for_vendor(conn, vendor_name)
+    items = db.get_stock_for_vendor(conn, owner_id, vendor_name)
     send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 def handle_sale(ukey, items, vendor_name):
-    chat_id = ukey[0]
+    chat_id, owner_id = ukey
     if not items:
         send_message(chat_id, "Samajh nahi aaya kya becha. Phir se batao?", reply_markup=MAIN_MENU)
         return
@@ -246,16 +246,16 @@ def handle_sale(ukey, items, vendor_name):
             continue
 
         if vendor_name:
-            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, vendor_name, name, qty, unit)
+            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, vendor_name, name, qty, unit)
             lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
             continue
 
-        matches = db.find_item_across_vendors(conn, name)
+        matches = db.find_item_across_vendors(conn, owner_id, name)
         if not matches:
             lines.append(f"• {html.escape(name)}: ye stock mein nahi mila.")
         elif len(matches) == 1:
             m = matches[0]
-            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, m["vendor_name"], m["item_name"], qty, unit)
+            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, m["vendor_name"], m["item_name"], qty, unit)
             lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
         else:
             vendors = " / ".join(html.escape(m["vendor_name"]) for m in matches)
@@ -376,12 +376,12 @@ def process_stock_manual(ukey, vendor_name, text):
 
 
 def confirm_stock_addition(ukey):
-    chat_id = ukey[0]
+    chat_id, owner_id = ukey
     data = pending_stock_confirmation.pop(ukey)
     conn = db.get_connection()
     lines = ["<b>Stock update ho gaya:</b>", ""]
     for item in data["items"]:
-        vendor, name, unit, new_qty = db.add_stock(conn, data["vendor_name"], item["name"], item["qty"], item.get("unit"))
+        vendor, name, unit, new_qty = db.add_stock(conn, owner_id, data["vendor_name"], item["name"], item["qty"], item.get("unit"))
         lines.append(f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
     send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 

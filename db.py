@@ -53,6 +53,7 @@ def init_db(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
             vendor_name TEXT NOT NULL,
             item_name TEXT NOT NULL,
             unit TEXT,
@@ -62,6 +63,7 @@ def init_db(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_movements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
             vendor_name TEXT NOT NULL,
             item_name TEXT NOT NULL,
             unit TEXT,
@@ -198,24 +200,29 @@ def _fuzzy_match(query, known_names):
     return normalized_to_actual[close[0]] if close else None
 
 
-def _find_vendor_in_stock(conn, vendor_name):
-    """Fuzzy-match a vendor name against ones already in the stock table. None if no match."""
-    known = [row[0] for row in conn.execute("SELECT DISTINCT vendor_name FROM stock").fetchall()]
+def _find_vendor_in_stock(conn, owner_id, vendor_name):
+    """Fuzzy-match a vendor name against ones this owner already has in stock. None if no match."""
+    known = [
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT vendor_name FROM stock WHERE owner_id = ?", (owner_id,)
+        ).fetchall()
+    ]
     return _fuzzy_match(vendor_name, known)
 
 
-def _find_item_for_vendor(conn, vendor_name, item_name):
+def _find_item_for_vendor(conn, owner_id, vendor_name, item_name):
     """Fuzzy-match an item name against one vendor's existing stock rows. None if no match."""
     known = [
         row[0] for row in conn.execute(
-            "SELECT item_name FROM stock WHERE vendor_name = ?", (vendor_name,)
+            "SELECT item_name FROM stock WHERE owner_id = ? AND vendor_name = ?", (owner_id, vendor_name)
         ).fetchall()
     ]
     return _fuzzy_match(item_name, known)
 
 
-def add_stock(conn, vendor_name, item_name, qty, unit=None):
+def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None):
     """Delivery: add qty to a vendor's stock of an item, creating the vendor/item if new.
+    Scoped to owner_id so different people's vendor lists never mix.
 
     Returns the canonical (vendor_name, item_name, unit, new_qty) — canonical meaning
     whatever spelling was already on record, so repeat deliveries with slightly
@@ -223,44 +230,46 @@ def add_stock(conn, vendor_name, item_name, qty, unit=None):
     overwrites the stored one (assumes the latest reading is right); passing none
     leaves whatever was already on record.
     """
-    vendor = _find_vendor_in_stock(conn, vendor_name) or vendor_name
-    item = _find_item_for_vendor(conn, vendor, item_name)
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name) or vendor_name
+    item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
 
     if item:
         if unit:
             conn.execute(
-                "UPDATE stock SET qty = qty + ?, unit = ? WHERE vendor_name = ? AND item_name = ?",
-                (qty, unit, vendor, item),
+                "UPDATE stock SET qty = qty + ?, unit = ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+                (qty, unit, owner_id, vendor, item),
             )
         else:
             conn.execute(
-                "UPDATE stock SET qty = qty + ? WHERE vendor_name = ? AND item_name = ?",
-                (qty, vendor, item),
+                "UPDATE stock SET qty = qty + ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+                (qty, owner_id, vendor, item),
             )
     else:
         item = item_name
         conn.execute(
-            "INSERT INTO stock (vendor_name, item_name, unit, qty) VALUES (?, ?, ?, ?)",
-            (vendor, item, unit, qty),
+            "INSERT INTO stock (owner_id, vendor_name, item_name, unit, qty) VALUES (?, ?, ?, ?, ?)",
+            (owner_id, vendor, item, unit, qty),
         )
 
     conn.execute(
-        "INSERT INTO stock_movements (vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, 'delivery')",
-        (vendor, item, unit, qty),
+        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, ?, 'delivery')",
+        (owner_id, vendor, item, unit, qty),
     )
     conn.commit()
 
     row = conn.execute(
-        "SELECT unit, qty FROM stock WHERE vendor_name = ? AND item_name = ?", (vendor, item)
+        "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?", (owner_id, vendor, item)
     ).fetchone()
     return vendor, item, row[0], row[1]
 
 
-def find_item_across_vendors(conn, item_name):
-    """Fuzzy-matches item_name against every vendor's stock. Used to resolve a sale
-    when the vendor wasn't mentioned: 0 matches = unknown item, 1 = unambiguous,
+def find_item_across_vendors(conn, owner_id, item_name):
+    """Fuzzy-matches item_name against this owner's vendors' stock. Used to resolve a
+    sale when the vendor wasn't mentioned: 0 matches = unknown item, 1 = unambiguous,
     >1 = ask the user which vendor's stock to sell from."""
-    rows = conn.execute("SELECT vendor_name, item_name, unit, qty FROM stock").fetchall()
+    rows = conn.execute(
+        "SELECT vendor_name, item_name, unit, qty FROM stock WHERE owner_id = ?", (owner_id,)
+    ).fetchall()
     target = _normalize(item_name)
     matches = []
     for vendor, item, unit, qty in rows:
@@ -276,34 +285,35 @@ def find_item_across_vendors(conn, item_name):
     return matches
 
 
-def record_sale(conn, vendor_name, item_name, qty, unit=None):
+def record_sale(conn, owner_id, vendor_name, item_name, qty, unit=None):
     """Sale: subtract qty from a vendor's stock of an item. Not clamped at 0 —
     a negative number is an honest signal something's off, not hidden."""
-    vendor = _find_vendor_in_stock(conn, vendor_name) or vendor_name
-    item = _find_item_for_vendor(conn, vendor, item_name) or item_name
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name) or vendor_name
+    item = _find_item_for_vendor(conn, owner_id, vendor, item_name) or item_name
 
     conn.execute(
-        "UPDATE stock SET qty = qty - ? WHERE vendor_name = ? AND item_name = ?",
-        (qty, vendor, item),
+        "UPDATE stock SET qty = qty - ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (qty, owner_id, vendor, item),
     )
     conn.execute(
-        "INSERT INTO stock_movements (vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, 'sale')",
-        (vendor, item, unit, -qty),
+        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, ?, 'sale')",
+        (owner_id, vendor, item, unit, -qty),
     )
     conn.commit()
 
     row = conn.execute(
-        "SELECT unit, qty FROM stock WHERE vendor_name = ? AND item_name = ?", (vendor, item)
+        "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?", (owner_id, vendor, item)
     ).fetchone()
     return (vendor, item, row[0], row[1]) if row else (vendor, item, unit, -qty)
 
 
-def get_stock_for_vendor(conn, vendor_name):
-    """All items and quantities on hand for one (fuzzy-resolved) vendor."""
-    vendor = _find_vendor_in_stock(conn, vendor_name)
+def get_stock_for_vendor(conn, owner_id, vendor_name):
+    """All items and quantities on hand for one (fuzzy-resolved) vendor of this owner's."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
     if not vendor:
         return []
     rows = conn.execute(
-        "SELECT item_name, unit, qty FROM stock WHERE vendor_name = ? ORDER BY item_name", (vendor,)
+        "SELECT item_name, unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? ORDER BY item_name",
+        (owner_id, vendor),
     ).fetchall()
     return [{"item_name": r[0], "unit": r[1], "qty": r[2]} for r in rows]
