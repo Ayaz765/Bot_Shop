@@ -84,7 +84,7 @@ MOCK_ALL_OK_INVOICE = {
 def _media_type(image_path):
     ext = os.path.splitext(image_path)[1].lower()
     return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-            ".webp": "image/webp"}.get(ext, "image/jpeg")
+            ".webp": "image/webp", ".pdf": "application/pdf"}.get(ext, "image/jpeg")
 
 
 def _api_key(env_var, hint):
@@ -138,7 +138,7 @@ def extract_invoice_anthropic(image_path, model):
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {
+                    {"type": "document" if image_path.lower().endswith(".pdf") else "image", "source": {
                         "type": "base64",
                         "media_type": _media_type(image_path),
                         "data": image_b64,
