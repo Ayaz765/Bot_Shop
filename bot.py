@@ -1,12 +1,13 @@
-"""Telegram front end for the same pipeline main.py uses (extract -> checker -> db).
+"""Telegram front end (LUMO): read/summarize invoices and track per-vendor stock.
 Long-polls the Telegram Bot API directly via requests — no new dependency.
 
-Flow: shopkeeper sends a bill photo -> bot replies with the Hinglish report,
-assuming everything matched the bill. If something was short/extra, they
-reply with the same shorthand as --received (e.g. "1:94, 3:10") and get an
-updated report. Only the first pass (before any correction) is saved to the
-database — db.py has no update path yet, so a correction is shown but not
-re-saved. Good enough for testing; revisit if this becomes the real product.
+Two menu paths:
+1) Read & Summarize Invoice — photo or PDF in, plain summary out. No discrepancy
+   checking (that flow, built around checker.py, has been retired from the bot).
+2) Add Items to Stock — vendor name, then photo or typed list, then a confirmation
+   before db.add_stock() runs. Stock is tracked per vendor (db.py Phase A).
+
+Selling something is free-text at any time ("5 Maggi becha") — see Phase E.
 """
 
 import html
@@ -17,10 +18,8 @@ from datetime import datetime
 
 import requests
 
-import checker
 import db
 import extract
-from main import parse_received
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 API_ROOT = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -29,48 +28,40 @@ PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 
 BOT_NAME = "LUMO"
 WELCOME = (
-    "Teen tareeke se bata sakte ho:\n\n"
-    "📷 Photo — bill kheech ke bhejo, main check kar dunga kitna paisa phansa hai\n"
-    "🏪 Vendor bata ke — pehle vendor ka naam bolo (jaise Ayaz), fir uski bill ki photo bhejo\n"
-    "✍️ Bina photo — type karke batao kya-kya aaya, price ke saath\n\n"
-    "Aur kabhi bhi \"purana hisaab\" dabake dekh sakte ho kisi vendor se ab tak kya-kya aaya."
+    "Kya karna hai?\n\n"
+    "1️⃣ Read & Summarize Invoice — bill ki photo ya PDF bhejo, summary milega "
+    "(vendor, items, quantity, price, tax, total)\n\n"
+    "2️⃣ Add Items to Stock — vendor se jo maal aaya wo apne stock mein jama karo, "
+    "photo se ya khud type karke"
 )
 
-pending = {}  # chat_id -> last extracted invoice, so a follow-up text can re-check it
 user_names = {}  # chat_id -> name, once they've told us
 awaiting_name = set()  # chat_id currently expected to reply with their name
-pending_photo = {}  # chat_id -> downloaded image path, if a photo arrived before we had a name
-vendor_override = {}  # chat_id -> vendor name to force onto invoices, set via /vendor
-awaiting_manual_entry = set()  # chat_id currently expected to describe a delivery in text
-awaiting_vendor_name = set()  # chat_id currently expected to reply with a vendor name
-awaiting_history_vendor = set()  # chat_id currently expected to name a vendor to look up
+pending_photo = {}  # chat_id -> downloaded file path, if one arrived before we had a name
 
-BTN_PHOTO = "📷 Photo bhejunga"
-BTN_VENDOR = "🏪 Vendor ka naam batau"
-BTN_MANUAL = "✍️ Bina photo ke likhunga"
-BTN_HISTORY = "📜 Purana hisaab"
+awaiting_stock_vendor = set()  # chat_id chose "Add to Stock", waiting for vendor name
+awaiting_stock_method = {}  # chat_id -> vendor_name, waiting for photo-or-manual choice
+awaiting_stock_photo = {}  # chat_id -> vendor_name, waiting for the delivery photo
+awaiting_stock_manual_text = {}  # chat_id -> vendor_name, waiting for typed item list
+pending_stock_confirmation = {}  # chat_id -> {"vendor_name", "items"}, waiting yes/no
 
-MAIN_MENU = {
-    "keyboard": [[BTN_PHOTO], [BTN_VENDOR], [BTN_MANUAL], [BTN_HISTORY]],
-    "resize_keyboard": True,
-}
+BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
+BTN_STOCK = "2️⃣ Add Items to Stock"
+MAIN_MENU = {"keyboard": [[BTN_SUMMARIZE], [BTN_STOCK]], "resize_keyboard": True}
 
-MANUAL_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar bina bill ki photo ke bata raha hai ki supplier se \
-kya maal aaya. Jo bhi items, quantity aur rate usne bataye hain unhe isi JSON shape mein nikaalo:
+BTN_STOCK_PHOTO = "📸 Add from Image"
+BTN_STOCK_MANUAL = "✍️ Add Manually"
+STOCK_METHOD_MENU = {"keyboard": [[BTN_STOCK_PHOTO], [BTN_STOCK_MANUAL]], "resize_keyboard": True}
 
-{
-  "supplier_name": string or null,
-  "invoice_number": null,
-  "invoice_date": null,
-  "items": [{"name": string, "qty": number, "rate": number or null, "amount": number or null}],
-  "sub_total": null,
-  "tax": null,
-  "grand_total": null,
-  "confidence": 1.0,
-  "unreadable_fields": []
-}
+BTN_YES = "✅ Haan, add karo"
+BTN_NO = "❌ Nahi, cancel"
+CONFIRM_MENU = {"keyboard": [[BTN_YES], [BTN_NO]], "resize_keyboard": True}
 
-Rate na bataya gaya ho to null rakho (amount bhi null). Sirf JSON do, kuch aur text nahi."""
+STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
+aur kitni quantity mein aaye. Sirf naam aur quantity chahiye, rate ki zarurat nahi. Isi JSON \
+shape mein nikaalo, sirf JSON do, kuch aur text nahi:
+
+{"items": [{"name": string, "qty": number}]}"""
 
 NOT_A_NAME = {
     "hi", "hii", "hiii", "hiiii", "hello", "hey", "hey lumo", "hii lumo",
@@ -96,56 +87,40 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
     requests.post(f"{API_ROOT}/sendMessage", json=payload)
 
 
-def format_report_html(invoice, issues):
-    header = html.escape(invoice.get("supplier_name") or "Unknown Supplier")
+def format_summary_html(invoice):
+    header = html.escape(invoice.get("supplier_name") or "Unknown Vendor")
     if invoice.get("invoice_number"):
         header += f" — {html.escape(str(invoice['invoice_number']))}"
+    if invoice.get("invoice_date"):
+        header += f" ({html.escape(str(invoice['invoice_date']))})"
 
     lines = [f"<b>{header}</b>", ""]
-    if not issues:
-        lines.append("✅ Sab sahi hai. Koi gadbad nahi mili.")
-    else:
-        for issue in issues:
-            lines.append(f"⚠️ {html.escape(issue['msg'])}")
+    for item in invoice.get("items", []):
+        parts = [html.escape(item.get("name") or "")]
+        if item.get("qty") is not None:
+            parts.append(f"qty {item['qty']:g}")
+        if item.get("rate") is not None:
+            parts.append(f"rate Rs{item['rate']:g}")
+        if item.get("amount") is not None:
+            parts.append(f"= Rs{item['amount']:g}")
+        lines.append("• " + " — ".join(parts))
 
-    total = round(sum(issue["loss"] for issue in issues), 2)
     lines.append("")
-    lines.append(f"<b>💰 Total phansa paisa: Rs{total:.2f}</b>")
+    if invoice.get("sub_total") is not None:
+        lines.append(f"Sub total: Rs{invoice['sub_total']:.2f}")
+    if invoice.get("tax") is not None:
+        lines.append(f"Tax: Rs{invoice['tax']:.2f}")
+    if invoice.get("grand_total") is not None:
+        lines.append(f"<b>Grand total: Rs{invoice['grand_total']:.2f}</b>")
     return "\n".join(lines)
 
 
-def format_correction_prompt(invoice):
-    numbered_items = "\n".join(
-        f"{i}. {html.escape(item['name'])}"
-        for i, item in enumerate(invoice.get("items", []), start=1)
-    )
-    return (
-        "<b>Maal gin liya?</b> Agar koi cheez kam ya zyada nikli, to uska number "
-        "aur jitna asal mein mila wo bhej do.\n\n"
-        f"{numbered_items}\n\n"
-        "Jaise: upar wali list mein No. 1 wali cheez ginne pe sirf 94 nikli (bill mein zyada thi), "
-        "to bhejo: <code>1:94</code>\n"
-        "Ek se zyada cheez mein farak ho to comma se: <code>1:94, 3:10</code>\n\n"
-        "Sab kuch bill jitna hi mila? Kuch bhejne ki zarurat nahi hai."
-    )
-
-
-def format_vendor_history(vendor_name, invoices):
-    if not invoices:
-        return f"<b>{html.escape(vendor_name)}</b> se abhi tak koi bill nahi mila mere paas."
-
-    lines = [f"<b>{html.escape(vendor_name)} — pichle {len(invoices)} bill</b>", ""]
-    total_loss = 0.0
-    for inv in invoices:
-        num = inv["invoice_number"] or "(number nahi)"
-        date = inv["invoice_date"] or ""
-        loss = inv["total_loss"] or 0.0
-        total_loss += loss
-        loss_note = f" — ⚠️ Rs{loss:.2f} phansa" if loss > 0 else ""
-        lines.append(f"• {html.escape(str(num))} {date}: Rs{inv['grand_total'] or 0:.2f}{loss_note}")
-
+def format_stock_confirmation(vendor_name, items):
+    lines = [f"<b>{html.escape(vendor_name)} se ye mila:</b>", ""]
+    for item in items:
+        lines.append(f"• {html.escape(item['name'])} — {item['qty']:g}")
     lines.append("")
-    lines.append(f"<b>💰 In sab mein total phansa: Rs{total_loss:.2f}</b>")
+    lines.append("Stock mein add kar doon?")
     return "\n".join(lines)
 
 
@@ -153,11 +128,10 @@ def casual_reply(chat_id, text):
     """For chit-chat ('kaise ho', 'hi') instead of the canned WELCOME every time."""
     name = user_names.get(chat_id, "")
     system_prompt = (
-        f"Tum {BOT_NAME} ho, ek dostana Hinglish-bolne wala Telegram bot jo supplier bills check "
-        f"karta hai (dukaandaar photo bhejta hai, tum bataate ho kitna paisa phansa hai). "
-        f"User ka naam {name or 'pata nahi'} hai. Koi casual baat kare (haal-chaal, hi, kaise ho) "
-        "to garmjoshi se, chhota sa (1-2 line) Hinglish reply do, jaise ek dost jawab deta hai. "
-        "Bill ka zikar sirf tab karo jab natural lage, zabardasti har baar mat dohrao."
+        f"Tum {BOT_NAME} ho, ek dostana Hinglish-bolne wala Telegram bot jo dukaandaar ke bills "
+        f"padhta/summarize karta hai aur unka stock track karta hai. User ka naam {name or 'pata nahi'} "
+        "hai. Koi casual baat kare (haal-chaal, hi, kaise ho) to garmjoshi se, chhota sa (1-2 line) "
+        "Hinglish reply do, jaise ek dost jawab deta hai. Kaam ka zikar sirf tab karo jab natural lage."
     )
     key = os.environ.get("GEMINI_API_KEY")
     resp = requests.post(
@@ -172,84 +146,103 @@ def casual_reply(chat_id, text):
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
-def extract_from_text(text):
-    """Manual entry: same invoice JSON shape as extract.py, but parsed from typed text."""
+def extract_stock_items(text):
     key = os.environ.get("GEMINI_API_KEY")
     resp = requests.post(
         f"{extract.GEMINI_API_ROOT}/models/{extract.DEFAULT_GEMINI_MODEL}:generateContent",
         params={"key": key},
         json={
-            "system_instruction": {"parts": [{"text": MANUAL_ENTRY_SYSTEM_PROMPT}]},
+            "system_instruction": {"parts": [{"text": STOCK_ENTRY_SYSTEM_PROMPT}]},
             "contents": [{"parts": [{"text": text}]}],
         },
     )
     resp.raise_for_status()
-    return extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+    parsed = extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+    return parsed.get("items", [])
 
 
-def download_photo(file_id, dest_path):
+def download_file(file_id, dest_path):
     file_info = requests.get(f"{API_ROOT}/getFile", params={"file_id": file_id}).json()["result"]
     data = requests.get(f"{FILE_ROOT}/{file_info['file_path']}").content
     with open(dest_path, "wb") as f:
         f.write(data)
 
 
-def process_invoice_data(chat_id, invoice):
-    """Shared by photo and manual-entry paths, once we have an invoice dict."""
-    if chat_id in vendor_override:
-        invoice["supplier_name"] = vendor_override[chat_id]
-
-    conn = db.get_connection()
-    issues = checker.check_invoice(conn, invoice, received_qty={})
-    db.save_invoice(
-        conn, invoice.get("supplier_name"), invoice.get("invoice_number"),
-        invoice.get("invoice_date"), invoice.get("grand_total"),
-        invoice.get("items", []), issues,
-    )
-    pending[chat_id] = invoice
-    send_message(chat_id, format_report_html(invoice, issues), parse_mode="HTML")
-    send_message(chat_id, format_correction_prompt(invoice), parse_mode="HTML")
-
-
-def process_photo(chat_id, image_path):
-    send_message(chat_id, f"{user_names[chat_id]}, bill padh raha hoon...")
-    try:
-        invoice = extract.extract(image_path, provider=PROVIDER)
-        process_invoice_data(chat_id, invoice)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        send_message(chat_id, f"Padhne mein dikkat aayi: {e}")
-
-
-def process_manual_entry(chat_id, text):
-    send_message(chat_id, f"{user_names[chat_id]}, samajh raha hoon...")
-    try:
-        invoice = extract_from_text(text)
-        process_invoice_data(chat_id, invoice)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        send_message(chat_id, f"Samajh nahi paya: {e}")
-
-
-def process_correction(chat_id, text):
-    try:
-        received_qty = parse_received(text)
-    except ValueError:
-        send_message(chat_id, 'Samajh nahi aaya. Aise likho: "1:94, 3:10"')
-        return
-    conn = db.get_connection()
-    issues = checker.check_invoice(conn, pending[chat_id], received_qty)
-    send_message(chat_id, format_report_html(pending[chat_id], issues), parse_mode="HTML")
-
-
 def save_incoming_photo(message):
     os.makedirs("bot_uploads", exist_ok=True)
     file_id = message["photo"][-1]["file_id"]
-    image_path = f"bot_uploads/{file_id}.jpg"
-    download_photo(file_id, image_path)
-    return image_path
+    path = f"bot_uploads/{file_id}.jpg"
+    download_file(file_id, path)
+    return path
+
+
+def save_incoming_document(message):
+    doc = message.get("document", {})
+    if doc.get("mime_type") != "application/pdf":
+        return None
+    os.makedirs("bot_uploads", exist_ok=True)
+    file_id = doc["file_id"]
+    path = f"bot_uploads/{file_id}.pdf"
+    download_file(file_id, path)
+    return path
+
+
+def process_summarize(chat_id, file_path):
+    send_message(chat_id, f"{user_names[chat_id]}, padh raha hoon...")
+    try:
+        invoice = extract.extract(file_path, provider=PROVIDER)
+        conn = db.get_connection()
+        db.save_invoice(
+            conn, invoice.get("supplier_name"), invoice.get("invoice_number"),
+            invoice.get("invoice_date"), invoice.get("grand_total"),
+            invoice.get("items", []), [],
+        )
+        send_message(chat_id, format_summary_html(invoice), parse_mode="HTML", reply_markup=MAIN_MENU)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        send_message(chat_id, "Padhne mein dikkat aayi, dobara try karo.", reply_markup=MAIN_MENU)
+
+
+def process_stock_photo(chat_id, vendor_name, file_path):
+    send_message(chat_id, f"{user_names[chat_id]}, photo padh raha hoon...")
+    try:
+        invoice = extract.extract(file_path, provider=PROVIDER)
+        items = [{"name": i["name"], "qty": i["qty"]} for i in invoice.get("items", []) if i.get("qty")]
+        if not items:
+            send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein.", reply_markup=MAIN_MENU)
+            return
+        pending_stock_confirmation[chat_id] = {"vendor_name": vendor_name, "items": items}
+        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        send_message(chat_id, "Padhne mein dikkat aayi, dobara try karo.", reply_markup=MAIN_MENU)
+
+
+def process_stock_manual(chat_id, vendor_name, text):
+    send_message(chat_id, f"{user_names[chat_id]}, samajh raha hoon...")
+    try:
+        items = [{"name": i["name"], "qty": i["qty"]} for i in extract_stock_items(text) if i.get("qty")]
+        if not items:
+            send_message(chat_id, "Koi item/quantity samajh nahi aayi.", reply_markup=MAIN_MENU)
+            return
+        pending_stock_confirmation[chat_id] = {"vendor_name": vendor_name, "items": items}
+        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        send_message(chat_id, "Samajh nahi paya, dobara try karo.", reply_markup=MAIN_MENU)
+
+
+def confirm_stock_addition(chat_id):
+    data = pending_stock_confirmation.pop(chat_id)
+    conn = db.get_connection()
+    lines = ["<b>Stock update ho gaya:</b>", ""]
+    for item in data["items"]:
+        vendor, name, new_qty = db.add_stock(conn, data["vendor_name"], item["name"], item["qty"])
+        lines.append(f"• {html.escape(name)}: ab {new_qty:g} ({html.escape(vendor)})")
+    send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 def handle_update(update):
@@ -258,7 +251,7 @@ def handle_update(update):
     print(f"DEBUG update: chat_id={chat_id} keys={list(message.keys())}", flush=True)
     if not chat_id:
         return
-    if "text" not in message and "photo" not in message:
+    if "text" not in message and "photo" not in message and "document" not in message:
         return  # ignore group system messages: joins, leaves, pins, etc.
 
     # New chat: greet by time of day and ask for a name before doing anything else.
@@ -272,71 +265,72 @@ def handle_update(update):
             awaiting_name.discard(chat_id)
             send_message(chat_id, f"Dhanyawad, {name}! {WELCOME}", reply_markup=MAIN_MENU)
             if chat_id in pending_photo:
-                process_photo(chat_id, pending_photo.pop(chat_id))
+                process_summarize(chat_id, pending_photo.pop(chat_id))
             return
 
         awaiting_name.add(chat_id)
         if "photo" in message:
             pending_photo[chat_id] = save_incoming_photo(message)
+        elif "document" in message:
+            path = save_incoming_document(message)
+            if path:
+                pending_photo[chat_id] = path
         send_message(chat_id, f"{time_greeting()}! Main {BOT_NAME} hoon. Pehle apna naam bata do?")
         return
 
-    if "photo" in message:
-        process_photo(chat_id, save_incoming_photo(message))
-
-    elif "text" in message:
-        text = message["text"].strip()
-
-        if text == BTN_PHOTO:
-            send_message(chat_id, "Theek hai, bill ki photo bhej do jab ready ho.")
-
-        elif text == BTN_VENDOR:
-            awaiting_vendor_name.add(chat_id)
-            send_message(chat_id, "Vendor ka naam batao (jaise: Ayaz) — jab tak na badlo, saare bills usi ke maane jayenge.")
-
-        elif text == BTN_MANUAL or text.lower() == "/manual":
-            awaiting_manual_entry.add(chat_id)
-            send_message(chat_id, 'Bina photo ke batao kya aaya, jaise: "5 Biscuit @10, 6 Maggi @132"')
-
-        elif text.lower().startswith("/vendor"):
-            name = text[len("/vendor"):].strip()
-            if not name:
-                send_message(chat_id, "Vendor ka naam bhi likho, jaise: /vendor Ayaz")
-            else:
-                vendor_override[chat_id] = name
-                send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {name} ke maane jayenge.")
-
-        elif chat_id in awaiting_vendor_name:
-            awaiting_vendor_name.discard(chat_id)
-            vendor_override[chat_id] = text
-            send_message(chat_id, f"Theek hai — jab tak na badlo, saare bills {text} ke maane jayenge.", reply_markup=MAIN_MENU)
-
-        elif text == BTN_HISTORY:
-            awaiting_history_vendor.add(chat_id)
-            send_message(chat_id, "Kis vendor ka hisaab dekhna hai? Naam batao.")
-
-        elif chat_id in awaiting_history_vendor:
-            awaiting_history_vendor.discard(chat_id)
-            conn = db.get_connection()
-            matched = db.find_supplier(conn, text)
-            if not matched:
-                send_message(chat_id, f"{text} ka koi bill mere paas nahi hai abhi.", reply_markup=MAIN_MENU)
-            else:
-                invoices = db.get_invoices_for_supplier(conn, matched)
-                send_message(chat_id, format_vendor_history(matched, invoices), parse_mode="HTML", reply_markup=MAIN_MENU)
-
-        elif chat_id in awaiting_manual_entry:
-            awaiting_manual_entry.discard(chat_id)
-            process_manual_entry(chat_id, text)
-
-        elif chat_id in pending:
-            process_correction(chat_id, text)
-
+    # Photo / PDF: which flow is active decides what happens to it.
+    if "photo" in message or "document" in message:
+        file_path = save_incoming_photo(message) if "photo" in message else save_incoming_document(message)
+        if not file_path:
+            send_message(chat_id, "Ye file PDF ya image nahi lagi.", reply_markup=MAIN_MENU)
+            return
+        if chat_id in awaiting_stock_photo:
+            vendor_name = awaiting_stock_photo.pop(chat_id)
+            process_stock_photo(chat_id, vendor_name, file_path)
         else:
-            try:
-                send_message(chat_id, casual_reply(chat_id, text), reply_markup=MAIN_MENU)
-            except Exception:
-                send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}", reply_markup=MAIN_MENU)
+            process_summarize(chat_id, file_path)
+        return
+
+    text = message["text"].strip()
+
+    if text == BTN_SUMMARIZE:
+        send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.")
+
+    elif text == BTN_STOCK:
+        awaiting_stock_vendor.add(chat_id)
+        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+
+    elif chat_id in awaiting_stock_vendor:
+        awaiting_stock_vendor.discard(chat_id)
+        awaiting_stock_method[chat_id] = text
+        send_message(chat_id, "Photo bhejoge ya khud type karoge?", reply_markup=STOCK_METHOD_MENU)
+
+    elif chat_id in awaiting_stock_method and text == BTN_STOCK_PHOTO:
+        vendor_name = awaiting_stock_method.pop(chat_id)
+        awaiting_stock_photo[chat_id] = vendor_name
+        send_message(chat_id, "Theek hai, photo bhej do.")
+
+    elif chat_id in awaiting_stock_method and text == BTN_STOCK_MANUAL:
+        vendor_name = awaiting_stock_method.pop(chat_id)
+        awaiting_stock_manual_text[chat_id] = vendor_name
+        send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"')
+
+    elif chat_id in awaiting_stock_manual_text:
+        vendor_name = awaiting_stock_manual_text.pop(chat_id)
+        process_stock_manual(chat_id, vendor_name, text)
+
+    elif chat_id in pending_stock_confirmation and text == BTN_YES:
+        confirm_stock_addition(chat_id)
+
+    elif chat_id in pending_stock_confirmation and text == BTN_NO:
+        pending_stock_confirmation.pop(chat_id)
+        send_message(chat_id, "Theek hai, cancel kar diya.", reply_markup=MAIN_MENU)
+
+    else:
+        try:
+            send_message(chat_id, casual_reply(chat_id, text), reply_markup=MAIN_MENU)
+        except Exception:
+            send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}", reply_markup=MAIN_MENU)
 
 
 def main():
