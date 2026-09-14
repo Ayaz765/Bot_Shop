@@ -34,14 +34,17 @@ Rules:
    pixel position — tilt shifts numbers up or down relative to the item names next to them.
 3. If a field is unreadable (torn, blurry, handwriting you can't parse), set it to null and
    add its name to unreadable_fields. Never guess a number to fill a gap.
-4. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
+4. Capture each item's unit of measure (kg, g, litre, ml, pcs, box, bag, dozen, MT, etc.) in
+   "unit" exactly as printed or abbreviated on the bill. If none is printed, use null — don't
+   assume "pcs".
+5. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
 
 {
   "supplier_name": string or null,
   "invoice_number": string or null,
   "invoice_date": string or null,
   "items": [
-    {"name": string, "qty": number or null, "rate": number or null, "amount": number or null}
+    {"name": string, "qty": number or null, "unit": string or null, "rate": number or null, "amount": number or null}
   ],
   "sub_total": number or null,
   "tax": number or null,
@@ -56,14 +59,14 @@ MOCK_INVOICE = {
     "invoice_number": "INV-2291",
     "invoice_date": "2026-09-01",
     "items": [
-        {"name": "Tata Salt 1Kg", "qty": 96, "rate": 32, "amount": 3072},
-        {"name": "Parle-G Biscuit 100g", "qty": 54, "rate": 10, "amount": 540},
-        {"name": "Maggi Noodles 70g (12pk)", "qty": 12, "rate": 132, "amount": 1684},
-        {"name": "Colgate Toothpaste 100g", "qty": 24, "rate": 45, "amount": 1080},
-        {"name": "Lifebuoy Soap 125g", "qty": 48, "rate": 22, "amount": 1056},
-        {"name": "Surf Excel 1Kg", "qty": 12, "rate": 118, "amount": 1416},
-        {"name": "Good Day Biscuit 100g", "qty": 36, "rate": 12, "amount": 432},
-        {"name": "Britannia Bread 400g", "qty": 20, "rate": 35, "amount": 700},
+        {"name": "Tata Salt 1Kg", "qty": 96, "unit": "pcs", "rate": 32, "amount": 3072},
+        {"name": "Parle-G Biscuit 100g", "qty": 54, "unit": "pcs", "rate": 10, "amount": 540},
+        {"name": "Maggi Noodles 70g (12pk)", "qty": 12, "unit": "pcs", "rate": 132, "amount": 1684},
+        {"name": "Colgate Toothpaste 100g", "qty": 24, "unit": "pcs", "rate": 45, "amount": 1080},
+        {"name": "Lifebuoy Soap 125g", "qty": 48, "unit": "pcs", "rate": 22, "amount": 1056},
+        {"name": "Surf Excel 1Kg", "qty": 12, "unit": "pcs", "rate": 118, "amount": 1416},
+        {"name": "Good Day Biscuit 100g", "qty": 36, "unit": "pcs", "rate": 12, "amount": 432},
+        {"name": "Britannia Bread 400g", "qty": 20, "unit": "pcs", "rate": 35, "amount": 700},
     ],
     "sub_total": 9980,
     "tax": 0,

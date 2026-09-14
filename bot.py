@@ -60,19 +60,22 @@ CONFIRM_MENU = {"keyboard": [[BTN_YES], [BTN_NO]], "resize_keyboard": True}
 NO_KEYBOARD = {"remove_keyboard": True}
 
 STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
-aur kitni quantity mein aaye. Sirf naam aur quantity chahiye, rate ki zarurat nahi. Isi JSON \
-shape mein nikaalo, sirf JSON do, kuch aur text nahi:
+aur kitni quantity mein aaye. Naam, quantity, aur unit (kg, litre, pcs, box, dozen, bag, etc.) \
+chahiye — rate ki zarurat nahi. Isi JSON shape mein nikaalo, sirf JSON do, kuch aur text nahi:
 
-{"items": [{"name": string, "qty": number}]}"""
+{"items": [{"name": string, "qty": number, "unit": string or null}]}
+
+Unit na bataya gaya ho to null rakho — mat maano "pcs" hai."""
 
 FREE_TEXT_SYSTEM_PROMPT = """Tum LUMO ho, ek Hinglish-bolne wala dukaan-stock-tracking bot. User \
 ka message padhkar uska intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "stock_query" | "chat", "items": [{"name": string, "qty": number}], \
-"vendor_name": string or null, "reply": string}
+{"intent": "sale" | "stock_query" | "chat", "items": [{"name": string, "qty": number, \
+"unit": string or null}], "vendor_name": string or null, "reply": string}
 
-- "sale": user ne bataya ki kuch becha/sold hua (jaise "5 Maggi becha", "10 soap nikal gaya"). \
-items mein wo bharo. vendor_name sirf tab bharo jab usne khud vendor ka naam liya ho.
+- "sale": user ne bataya ki kuch becha/sold hua (jaise "5 kg Sugar becha", "10 pcs soap nikal \
+gaya"). items mein wo bharo, unit agar bataya ho. vendor_name sirf tab bharo jab usne khud \
+vendor ka naam liya ho.
 - "stock_query": user kisi vendor ka stock/hisaab pooch raha hai (jaise "Ayaz ka stock batao", \
 "Ramesh se kya aaya hai"). vendor_name zaroor bharo.
 - "chat": baaki sab (greeting, casual baat, sawaal). "reply" mein chhota (1-2 line) dostana \
@@ -113,7 +116,7 @@ def format_summary_html(invoice):
     for item in invoice.get("items", []):
         parts = [html.escape(item.get("name") or "")]
         if item.get("qty") is not None:
-            parts.append(f"qty {item['qty']:g}")
+            parts.append(f"qty {fmt_qty(item['qty'], item.get('unit'))}")
         if item.get("rate") is not None:
             parts.append(f"rate Rs{item['rate']:g}")
         if item.get("amount") is not None:
@@ -130,10 +133,14 @@ def format_summary_html(invoice):
     return "\n".join(lines)
 
 
+def fmt_qty(qty, unit):
+    return f"{qty:g} {unit}" if unit else f"{qty:g}"
+
+
 def format_stock_confirmation(vendor_name, items):
     lines = [f"<b>{html.escape(vendor_name)} se ye mila:</b>", ""]
     for item in items:
-        lines.append(f"• {html.escape(item['name'])} — {item['qty']:g}")
+        lines.append(f"• {html.escape(item['name'])} — {fmt_qty(item['qty'], item.get('unit'))}")
     lines.append("")
     lines.append("Stock mein add kar doon?")
     return "\n".join(lines)
@@ -160,7 +167,7 @@ def format_stock_report(vendor_name, items):
         return f"{html.escape(vendor_name)} ka koi stock record nahi hai mere paas."
     lines = [f"<b>{html.escape(vendor_name)} ka stock:</b>", ""]
     for item in items:
-        lines.append(f"• {html.escape(item['item_name'])} — {item['qty']:g}")
+        lines.append(f"• {html.escape(item['item_name'])} — {fmt_qty(item['qty'], item.get('unit'))}")
     return "\n".join(lines)
 
 
@@ -181,13 +188,13 @@ def handle_sale(chat_id, items, vendor_name):
     conn = db.get_connection()
     lines = []
     for item in items:
-        name, qty = item.get("name"), item.get("qty")
+        name, qty, unit = item.get("name"), item.get("qty"), item.get("unit")
         if not name or not qty:
             continue
 
         if vendor_name:
-            vendor, matched_item, new_qty = db.record_sale(conn, vendor_name, name, qty)
-            lines.append(f"• {html.escape(matched_item)}: ab {new_qty:g} bacha ({html.escape(vendor)})")
+            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, vendor_name, name, qty, unit)
+            lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
             continue
 
         matches = db.find_item_across_vendors(conn, name)
@@ -195,8 +202,8 @@ def handle_sale(chat_id, items, vendor_name):
             lines.append(f"• {html.escape(name)}: ye stock mein nahi mila.")
         elif len(matches) == 1:
             m = matches[0]
-            vendor, matched_item, new_qty = db.record_sale(conn, m["vendor_name"], m["item_name"], qty)
-            lines.append(f"• {html.escape(matched_item)}: ab {new_qty:g} bacha ({html.escape(vendor)})")
+            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, m["vendor_name"], m["item_name"], qty, unit)
+            lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
         else:
             vendors = ", ".join(html.escape(m["vendor_name"]) for m in matches)
             lines.append(f"• {html.escape(name)}: kis vendor ka becha? ({vendors}) — phir se batao vendor ka naam le kar")
@@ -266,7 +273,10 @@ def process_stock_photo(chat_id, vendor_name, file_path):
     send_message(chat_id, f"{user_names[chat_id]}, photo padh raha hoon...")
     try:
         invoice = extract.extract(file_path, provider=PROVIDER)
-        items = [{"name": i["name"], "qty": i["qty"]} for i in invoice.get("items", []) if i.get("qty")]
+        items = [
+            {"name": i["name"], "qty": i["qty"], "unit": i.get("unit")}
+            for i in invoice.get("items", []) if i.get("qty")
+        ]
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein.", reply_markup=MAIN_MENU)
             return
@@ -281,7 +291,10 @@ def process_stock_photo(chat_id, vendor_name, file_path):
 def process_stock_manual(chat_id, vendor_name, text):
     send_message(chat_id, f"{user_names[chat_id]}, samajh raha hoon...")
     try:
-        items = [{"name": i["name"], "qty": i["qty"]} for i in extract_stock_items(text) if i.get("qty")]
+        items = [
+            {"name": i["name"], "qty": i["qty"], "unit": i.get("unit")}
+            for i in extract_stock_items(text) if i.get("qty")
+        ]
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi.", reply_markup=MAIN_MENU)
             return
@@ -298,8 +311,8 @@ def confirm_stock_addition(chat_id):
     conn = db.get_connection()
     lines = ["<b>Stock update ho gaya:</b>", ""]
     for item in data["items"]:
-        vendor, name, new_qty = db.add_stock(conn, data["vendor_name"], item["name"], item["qty"])
-        lines.append(f"• {html.escape(name)}: ab {new_qty:g} ({html.escape(vendor)})")
+        vendor, name, unit, new_qty = db.add_stock(conn, data["vendor_name"], item["name"], item["qty"], item.get("unit"))
+        lines.append(f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
     send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
