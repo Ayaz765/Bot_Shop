@@ -57,11 +57,26 @@ BTN_YES = "✅ Haan, add karo"
 BTN_NO = "❌ Nahi, cancel"
 CONFIRM_MENU = {"keyboard": [[BTN_YES], [BTN_NO]], "resize_keyboard": True}
 
+NO_KEYBOARD = {"remove_keyboard": True}
+
 STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
 aur kitni quantity mein aaye. Sirf naam aur quantity chahiye, rate ki zarurat nahi. Isi JSON \
 shape mein nikaalo, sirf JSON do, kuch aur text nahi:
 
 {"items": [{"name": string, "qty": number}]}"""
+
+FREE_TEXT_SYSTEM_PROMPT = """Tum LUMO ho, ek Hinglish-bolne wala dukaan-stock-tracking bot. User \
+ka message padhkar uska intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
+
+{"intent": "sale" | "stock_query" | "chat", "items": [{"name": string, "qty": number}], \
+"vendor_name": string or null, "reply": string}
+
+- "sale": user ne bataya ki kuch becha/sold hua (jaise "5 Maggi becha", "10 soap nikal gaya"). \
+items mein wo bharo. vendor_name sirf tab bharo jab usne khud vendor ka naam liya ho.
+- "stock_query": user kisi vendor ka stock/hisaab pooch raha hai (jaise "Ayaz ka stock batao", \
+"Ramesh se kya aaya hai"). vendor_name zaroor bharo.
+- "chat": baaki sab (greeting, casual baat, sawaal). "reply" mein chhota (1-2 line) dostana \
+Hinglish jawab do jaise ek dost deta hai."""
 
 NOT_A_NAME = {
     "hi", "hii", "hiii", "hiiii", "hello", "hey", "hey lumo", "hii lumo",
@@ -124,26 +139,69 @@ def format_stock_confirmation(vendor_name, items):
     return "\n".join(lines)
 
 
-def casual_reply(chat_id, text):
-    """For chit-chat ('kaise ho', 'hi') instead of the canned WELCOME every time."""
-    name = user_names.get(chat_id, "")
-    system_prompt = (
-        f"Tum {BOT_NAME} ho, ek dostana Hinglish-bolne wala Telegram bot jo dukaandaar ke bills "
-        f"padhta/summarize karta hai aur unka stock track karta hai. User ka naam {name or 'pata nahi'} "
-        "hai. Koi casual baat kare (haal-chaal, hi, kaise ho) to garmjoshi se, chhota sa (1-2 line) "
-        "Hinglish reply do, jaise ek dost jawab deta hai. Kaam ka zikar sirf tab karo jab natural lage."
-    )
+def interpret_free_text(text):
+    """One Gemini call classifies + extracts: sale, stock lookup, or plain chat —
+    avoids a separate detect-then-reply pair of calls on every ordinary message."""
     key = os.environ.get("GEMINI_API_KEY")
     resp = requests.post(
         f"{extract.GEMINI_API_ROOT}/models/{extract.DEFAULT_GEMINI_MODEL}:generateContent",
         params={"key": key},
         json={
-            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "system_instruction": {"parts": [{"text": FREE_TEXT_SYSTEM_PROMPT}]},
             "contents": [{"parts": [{"text": text}]}],
         },
     )
     resp.raise_for_status()
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+
+def format_stock_report(vendor_name, items):
+    if not items:
+        return f"{html.escape(vendor_name)} ka koi stock record nahi hai mere paas."
+    lines = [f"<b>{html.escape(vendor_name)} ka stock:</b>", ""]
+    for item in items:
+        lines.append(f"• {html.escape(item['item_name'])} — {item['qty']:g}")
+    return "\n".join(lines)
+
+
+def handle_stock_query(chat_id, vendor_name):
+    if not vendor_name:
+        send_message(chat_id, "Kaunse vendor ka stock dekhna hai?", reply_markup=MAIN_MENU)
+        return
+    conn = db.get_connection()
+    items = db.get_stock_for_vendor(conn, vendor_name)
+    send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML", reply_markup=MAIN_MENU)
+
+
+def handle_sale(chat_id, items, vendor_name):
+    if not items:
+        send_message(chat_id, "Samajh nahi aaya kya becha. Phir se batao?", reply_markup=MAIN_MENU)
+        return
+
+    conn = db.get_connection()
+    lines = []
+    for item in items:
+        name, qty = item.get("name"), item.get("qty")
+        if not name or not qty:
+            continue
+
+        if vendor_name:
+            vendor, matched_item, new_qty = db.record_sale(conn, vendor_name, name, qty)
+            lines.append(f"• {html.escape(matched_item)}: ab {new_qty:g} bacha ({html.escape(vendor)})")
+            continue
+
+        matches = db.find_item_across_vendors(conn, name)
+        if not matches:
+            lines.append(f"• {html.escape(name)}: ye stock mein nahi mila.")
+        elif len(matches) == 1:
+            m = matches[0]
+            vendor, matched_item, new_qty = db.record_sale(conn, m["vendor_name"], m["item_name"], qty)
+            lines.append(f"• {html.escape(matched_item)}: ab {new_qty:g} bacha ({html.escape(vendor)})")
+        else:
+            vendors = ", ".join(html.escape(m["vendor_name"]) for m in matches)
+            lines.append(f"• {html.escape(name)}: kis vendor ka becha? ({vendors}) — phir se batao vendor ka naam le kar")
+
+    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 def extract_stock_items(text):
@@ -294,11 +352,11 @@ def handle_update(update):
     text = message["text"].strip()
 
     if text == BTN_SUMMARIZE:
-        send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.")
+        send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.", reply_markup=NO_KEYBOARD)
 
     elif text == BTN_STOCK:
         awaiting_stock_vendor.add(chat_id)
-        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.", reply_markup=NO_KEYBOARD)
 
     elif chat_id in awaiting_stock_vendor:
         awaiting_stock_vendor.discard(chat_id)
@@ -308,12 +366,12 @@ def handle_update(update):
     elif chat_id in awaiting_stock_method and text == BTN_STOCK_PHOTO:
         vendor_name = awaiting_stock_method.pop(chat_id)
         awaiting_stock_photo[chat_id] = vendor_name
-        send_message(chat_id, "Theek hai, photo bhej do.")
+        send_message(chat_id, "Theek hai, photo bhej do.", reply_markup=NO_KEYBOARD)
 
     elif chat_id in awaiting_stock_method and text == BTN_STOCK_MANUAL:
         vendor_name = awaiting_stock_method.pop(chat_id)
         awaiting_stock_manual_text[chat_id] = vendor_name
-        send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"')
+        send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"', reply_markup=NO_KEYBOARD)
 
     elif chat_id in awaiting_stock_manual_text:
         vendor_name = awaiting_stock_manual_text.pop(chat_id)
@@ -328,9 +386,20 @@ def handle_update(update):
 
     else:
         try:
-            send_message(chat_id, casual_reply(chat_id, text), reply_markup=MAIN_MENU)
+            result = interpret_free_text(text)
         except Exception:
+            import traceback
+            traceback.print_exc()
             send_message(chat_id, f"{user_names[chat_id]}, {WELCOME}", reply_markup=MAIN_MENU)
+            return
+
+        intent = result.get("intent")
+        if intent == "stock_query":
+            handle_stock_query(chat_id, result.get("vendor_name"))
+        elif intent == "sale":
+            handle_sale(chat_id, result.get("items", []), result.get("vendor_name"))
+        else:
+            send_message(chat_id, result.get("reply") or WELCOME, reply_markup=MAIN_MENU)
 
 
 def main():
