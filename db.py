@@ -50,6 +50,24 @@ def init_db(conn):
             loss REAL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_name TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            qty REAL NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_name TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            change REAL NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
 
 
@@ -155,3 +173,127 @@ def get_running_total_loss(conn, supplier_name=None):
     else:
         row = conn.execute("SELECT COALESCE(SUM(total_loss), 0) FROM invoices").fetchone()
     return row[0]
+
+
+def _fuzzy_match(query, known_names):
+    """Best match for `query` among `known_names`. Checks substring containment first
+    (so a nickname like "Ramesh" finds "Ramesh Traders" — difflib's ratio alone penalizes
+    that length gap too heavily), then falls back to difflib for typos/case/spacing."""
+    if not known_names:
+        return None
+    normalized_to_actual = {_normalize(n): n for n in known_names}
+    target = _normalize(query)
+
+    if target in normalized_to_actual:
+        return normalized_to_actual[target]
+
+    substring_matches = [n for n in normalized_to_actual if target in n or n in target]
+    if substring_matches:
+        best = min(substring_matches, key=lambda n: abs(len(n) - len(target)))
+        return normalized_to_actual[best]
+
+    close = difflib.get_close_matches(target, normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF)
+    return normalized_to_actual[close[0]] if close else None
+
+
+def _find_vendor_in_stock(conn, vendor_name):
+    """Fuzzy-match a vendor name against ones already in the stock table. None if no match."""
+    known = [row[0] for row in conn.execute("SELECT DISTINCT vendor_name FROM stock").fetchall()]
+    return _fuzzy_match(vendor_name, known)
+
+
+def _find_item_for_vendor(conn, vendor_name, item_name):
+    """Fuzzy-match an item name against one vendor's existing stock rows. None if no match."""
+    known = [
+        row[0] for row in conn.execute(
+            "SELECT item_name FROM stock WHERE vendor_name = ?", (vendor_name,)
+        ).fetchall()
+    ]
+    return _fuzzy_match(item_name, known)
+
+
+def add_stock(conn, vendor_name, item_name, qty):
+    """Delivery: add qty to a vendor's stock of an item, creating the vendor/item if new.
+
+    Returns the canonical (vendor_name, item_name, new_qty) — canonical meaning
+    whatever spelling was already on record, so repeat deliveries with slightly
+    different extraction wording accumulate onto the same row.
+    """
+    vendor = _find_vendor_in_stock(conn, vendor_name) or vendor_name
+    item = _find_item_for_vendor(conn, vendor, item_name)
+
+    if item:
+        conn.execute(
+            "UPDATE stock SET qty = qty + ? WHERE vendor_name = ? AND item_name = ?",
+            (qty, vendor, item),
+        )
+    else:
+        item = item_name
+        conn.execute(
+            "INSERT INTO stock (vendor_name, item_name, qty) VALUES (?, ?, ?)",
+            (vendor, item, qty),
+        )
+
+    conn.execute(
+        "INSERT INTO stock_movements (vendor_name, item_name, change, reason) VALUES (?, ?, ?, 'delivery')",
+        (vendor, item, qty),
+    )
+    conn.commit()
+
+    new_qty = conn.execute(
+        "SELECT qty FROM stock WHERE vendor_name = ? AND item_name = ?", (vendor, item)
+    ).fetchone()[0]
+    return vendor, item, new_qty
+
+
+def find_item_across_vendors(conn, item_name):
+    """Fuzzy-matches item_name against every vendor's stock. Used to resolve a sale
+    when the vendor wasn't mentioned: 0 matches = unknown item, 1 = unambiguous,
+    >1 = ask the user which vendor's stock to sell from."""
+    rows = conn.execute("SELECT vendor_name, item_name, qty FROM stock").fetchall()
+    target = _normalize(item_name)
+    matches = []
+    for vendor, item, qty in rows:
+        normalized_item = _normalize(item)
+        is_match = (
+            target == normalized_item
+            or target in normalized_item
+            or normalized_item in target
+            or difflib.SequenceMatcher(None, target, normalized_item).ratio() >= NAME_MATCH_CUTOFF
+        )
+        if is_match:
+            matches.append({"vendor_name": vendor, "item_name": item, "qty": qty})
+    return matches
+
+
+def record_sale(conn, vendor_name, item_name, qty):
+    """Sale: subtract qty from a vendor's stock of an item. Not clamped at 0 —
+    a negative number is an honest signal something's off, not hidden."""
+    vendor = _find_vendor_in_stock(conn, vendor_name) or vendor_name
+    item = _find_item_for_vendor(conn, vendor, item_name) or item_name
+
+    conn.execute(
+        "UPDATE stock SET qty = qty - ? WHERE vendor_name = ? AND item_name = ?",
+        (qty, vendor, item),
+    )
+    conn.execute(
+        "INSERT INTO stock_movements (vendor_name, item_name, change, reason) VALUES (?, ?, ?, 'sale')",
+        (vendor, item, -qty),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT qty FROM stock WHERE vendor_name = ? AND item_name = ?", (vendor, item)
+    ).fetchone()
+    return vendor, item, row[0] if row else -qty
+
+
+def get_stock_for_vendor(conn, vendor_name):
+    """All items and quantities on hand for one (fuzzy-resolved) vendor."""
+    vendor = _find_vendor_in_stock(conn, vendor_name)
+    if not vendor:
+        return []
+    rows = conn.execute(
+        "SELECT item_name, qty FROM stock WHERE vendor_name = ? ORDER BY item_name", (vendor,)
+    ).fetchall()
+    return [{"item_name": r[0], "qty": r[1]} for r in rows]
