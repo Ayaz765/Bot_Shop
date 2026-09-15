@@ -15,6 +15,8 @@ def _normalize(name):
 
 
 def get_connection(db_path=DB_PATH):
+    dirname = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(dirname, exist_ok=True)
     conn = sqlite3.connect(db_path)
     init_db(conn)
     return conn
@@ -75,6 +77,27 @@ def init_db(conn):
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            owner_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def get_user_name(conn, owner_id):
+    """A person's saved name, or None if they've never told us — survives bot restarts."""
+    row = conn.execute("SELECT name FROM users WHERE owner_id = ?", (owner_id,)).fetchone()
+    return row[0] if row else None
+
+
+def set_user_name(conn, owner_id, name):
+    conn.execute(
+        "INSERT INTO users (owner_id, name) VALUES (?, ?) "
+        "ON CONFLICT(owner_id) DO UPDATE SET name = excluded.name",
+        (owner_id, name),
+    )
     conn.commit()
 
 

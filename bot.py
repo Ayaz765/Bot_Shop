@@ -436,14 +436,21 @@ def handle_update(update):
     if "text" not in message and "photo" not in message and "document" not in message:
         return  # ignore group system messages: joins, leaves, pins, etc.
 
-    # New sender in this chat: greet by time of day and ask for a name first.
+    # New sender in this chat: check for a saved name first (survives restarts),
+    # then greet by time of day and ask for one before doing anything else.
     if ukey not in user_names:
-        if ukey in awaiting_name and "text" in message:
+        conn = db.get_connection()
+        saved_name = db.get_user_name(conn, sender_id)
+        if saved_name:
+            user_names[ukey] = saved_name
+            # fall through — handled like any other message below, no re-onboarding
+        elif ukey in awaiting_name and "text" in message:
             name = message["text"].strip()
             if name.lower() in NOT_A_NAME or name in ALL_BUTTON_TEXTS:
                 send_message(chat_id, "Wo naam nahi laga 😅 Bas apna naam likho, jaise: Ramesh")
                 return
             user_names[ukey] = name
+            db.set_user_name(conn, sender_id, name)
             awaiting_name.discard(ukey)
             # One-time cleanup: clears any old-style reply keyboard still showing from
             # before this bot switched to inline buttons. Can't combine remove_keyboard
@@ -453,16 +460,16 @@ def handle_update(update):
             if ukey in pending_photo:
                 process_summarize(ukey, pending_photo.pop(ukey))
             return
-
-        awaiting_name.add(ukey)
-        if "photo" in message:
-            pending_photo[ukey] = save_incoming_photo(message)
-        elif "document" in message:
-            path = save_incoming_document(message)
-            if path:
-                pending_photo[ukey] = path
-        send_message(chat_id, f"{time_greeting()}! Main {BOT_NAME} hoon. Pehle apna naam bata do?")
-        return
+        else:
+            awaiting_name.add(ukey)
+            if "photo" in message:
+                pending_photo[ukey] = save_incoming_photo(message)
+            elif "document" in message:
+                path = save_incoming_document(message)
+                if path:
+                    pending_photo[ukey] = path
+            send_message(chat_id, f"{time_greeting()}! Main {BOT_NAME} hoon. Pehle apna naam bata do?")
+            return
 
     # Photo / PDF: which flow is active decides what happens to it.
     if "photo" in message or "document" in message:
