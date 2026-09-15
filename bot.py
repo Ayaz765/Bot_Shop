@@ -127,6 +127,18 @@ NOT_A_NAME = {
     "namaste", "namaskar", "salam", "yo", "ok", "okay", "test", "hlo", "lumo",
 }
 
+QUESTION_WORDS = ("kya", "kaise", "kyu", "kyun", "kaun", "kab", "kahan", "help", "madad", "samajh")
+
+
+def looks_like_question(text):
+    """A stuck user asking 'what's happening?' shouldn't have that swallowed as
+    their name/vendor name — reply to the question first, then re-prompt."""
+    lowered = text.lower().strip()
+    if "?" in text:
+        return True
+    words = lowered.split()
+    return any(w in QUESTION_WORDS for w in words)
+
 
 def time_greeting():
     hour = datetime.now().hour
@@ -211,6 +223,17 @@ def interpret_free_text(text):
     )
     resp.raise_for_status()
     return extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+
+def answer_question(text):
+    """Natural-language answer for a question asked mid-flow (e.g. someone stuck
+    at 'what's your name?' asks 'what does this do?' instead). Reuses the same
+    classifier as the main fallback — its 'reply' field stands alone fine here."""
+    try:
+        result = interpret_free_text(text)
+        return result.get("reply") or "Bas thoda sa detail chahiye, phir aage badhte hain."
+    except Exception:
+        return "Bas thoda sa detail chahiye, phir aage badhte hain."
 
 
 def format_stock_report(vendor_name, items):
@@ -446,6 +469,10 @@ def handle_update(update):
             # fall through — handled like any other message below, no re-onboarding
         elif ukey in awaiting_name and "text" in message:
             name = message["text"].strip()
+            if looks_like_question(name):
+                send_message(chat_id, answer_question(name))
+                send_message(chat_id, "Ab apna naam bata do?")
+                return
             if name.lower() in NOT_A_NAME or name in ALL_BUTTON_TEXTS:
                 send_message(chat_id, "Wo naam nahi laga 😅 Bas apna naam likho, jaise: Ramesh")
                 return
@@ -499,6 +526,10 @@ def handle_update(update):
     elif ukey in awaiting_stock_vendor and text in ALL_BUTTON_TEXTS:
         send_message(chat_id, "Vendor ka naam likho (button nahi), jaise: Ayaz")
 
+    elif ukey in awaiting_stock_vendor and looks_like_question(text):
+        send_message(chat_id, answer_question(text))
+        send_message(chat_id, "Ab batao, kaunse vendor se maal aaya?")
+
     elif ukey in awaiting_stock_vendor:
         awaiting_stock_vendor.discard(ukey)
         awaiting_stock_method[ukey] = text
@@ -513,6 +544,10 @@ def handle_update(update):
         vendor_name = awaiting_stock_method.pop(ukey)
         awaiting_stock_manual_text[ukey] = vendor_name
         send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"', reply_markup=NO_KEYBOARD)
+
+    elif ukey in awaiting_stock_manual_text and looks_like_question(text):
+        send_message(chat_id, answer_question(text))
+        send_message(chat_id, 'Ab batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"')
 
     elif ukey in awaiting_stock_manual_text:
         vendor_name = awaiting_stock_manual_text[ukey]
