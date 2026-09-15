@@ -1,9 +1,12 @@
 """SQLite storage: past invoices, per-item rate history, running mismatch totals."""
 
 import difflib
+import os
 import sqlite3
 
-DB_PATH = "billcheck.db"
+# Overridable so a host with an ephemeral filesystem (e.g. Railway) can point this
+# at a mounted persistent volume instead of losing the db on every redeploy.
+DB_PATH = os.environ.get("DB_PATH", "billcheck.db")
 NAME_MATCH_CUTOFF = 0.8  # how close an item name must be to count as "the same item"
 
 
