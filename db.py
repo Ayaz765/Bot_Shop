@@ -3,6 +3,7 @@
 import difflib
 import os
 import sqlite3
+import uuid
 
 # Overridable so a host with an ephemeral filesystem (e.g. Railway) can point this
 # at a mounted persistent volume instead of losing the db on every redeploy.
@@ -74,6 +75,7 @@ def init_db(conn):
             unit TEXT,
             change REAL NOT NULL,
             reason TEXT NOT NULL,
+            batch_id TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -83,7 +85,21 @@ def init_db(conn):
             name TEXT NOT NULL
         )
     """)
+    # Migration for dbs created before batch_id existed — CREATE TABLE IF NOT
+    # EXISTS above is a no-op on an already-existing table, so old installs need
+    # this column added by hand. Old rows keep batch_id NULL, which undo_last_
+    # movement treats as "a batch of one" (its original single-row behavior).
+    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(stock_movements)").fetchall()]
+    if "batch_id" not in existing_cols:
+        conn.execute("ALTER TABLE stock_movements ADD COLUMN batch_id TEXT")
     conn.commit()
+
+
+def new_batch_id():
+    """One id shared by every stock_movements row that came from the same
+    user message — "Maggi, Egg, Pizza aaya" in one go groups all three so
+    undo_last_movement can reverse the whole thing, not just the last item."""
+    return uuid.uuid4().hex[:12]
 
 
 def get_user_name(conn, owner_id):
@@ -246,7 +262,7 @@ def _find_item_for_vendor(conn, owner_id, vendor_name, item_name):
     return _fuzzy_match(item_name, known)
 
 
-def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None):
+def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id=None):
     """Delivery: add qty to a vendor's stock of an item, creating the vendor/item if new.
     Scoped to owner_id so different people's vendor lists never mix.
 
@@ -255,6 +271,9 @@ def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None):
     different extraction wording accumulate onto the same row. A newly-given unit
     overwrites the stored one (assumes the latest reading is right); passing none
     leaves whatever was already on record.
+
+    batch_id (optional): tag applied to the stock_movements row so multiple items
+    from one message ("Maggi, Egg aaya") can be undone together as a unit.
     """
     vendor = _find_vendor_in_stock(conn, owner_id, vendor_name) or vendor_name
     item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
@@ -278,8 +297,9 @@ def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None):
         )
 
     conn.execute(
-        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, ?, 'delivery')",
-        (owner_id, vendor, item, unit, qty),
+        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason, batch_id) "
+        "VALUES (?, ?, ?, ?, ?, 'delivery', ?)",
+        (owner_id, vendor, item, unit, qty, batch_id),
     )
     conn.commit()
 
@@ -311,26 +331,101 @@ def find_item_across_vendors(conn, owner_id, item_name):
     return matches
 
 
-def record_sale(conn, owner_id, vendor_name, item_name, qty, unit=None):
+def record_sale(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id=None):
     """Sale: subtract qty from a vendor's stock of an item. Not clamped at 0 —
-    a negative number is an honest signal something's off, not hidden."""
+    a negative number is an honest signal something's off, not hidden.
+
+    Returns None if this vendor has no record of the item at all — there's
+    nothing to sell, so no row gets created (previously this silently made a
+    fresh row and sold it into negative, e.g. a never-stocked "pizza" showing
+    "-50 pcs bacha").
+
+    batch_id (optional): tag applied to the stock_movements row so multiple items
+    from one message can be undone together as a unit.
+    """
     vendor = _find_vendor_in_stock(conn, owner_id, vendor_name) or vendor_name
-    item = _find_item_for_vendor(conn, owner_id, vendor, item_name) or item_name
+    item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
+    if item is None:
+        return None
 
     conn.execute(
         "UPDATE stock SET qty = qty - ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
         (qty, owner_id, vendor, item),
     )
     conn.execute(
-        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason) VALUES (?, ?, ?, ?, ?, 'sale')",
-        (owner_id, vendor, item, unit, -qty),
+        "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason, batch_id) "
+        "VALUES (?, ?, ?, ?, ?, 'sale', ?)",
+        (owner_id, vendor, item, unit, -qty, batch_id),
     )
     conn.commit()
 
     row = conn.execute(
         "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?", (owner_id, vendor, item)
     ).fetchone()
-    return (vendor, item, row[0], row[1]) if row else (vendor, item, unit, -qty)
+    return vendor, item, row[0], row[1]
+
+
+def undo_last_movement(conn, owner_id):
+    """Reverses this owner's most recent BATCH of stock movements — everything
+    that shares the last row's batch_id, e.g. all three items from one "Maggi,
+    Egg, Pizza aaya" message, not just the last one. Old rows from before
+    batch_id existed have it NULL, which falls back to the original one-row
+    behavior. Reversing an undo is just a redo (the compensating rows get their
+    own fresh batch_id, so undoing them again reverses the whole undo as a unit).
+
+    Returns a list of (vendor_name, item_name, unit, new_qty, reason) tuples, one
+    per movement undone, or None if there's nothing to undo."""
+    last = conn.execute(
+        "SELECT id, batch_id FROM stock_movements WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
+        (owner_id,),
+    ).fetchone()
+    if not last:
+        return None
+    last_id, batch_id = last
+
+    if batch_id:
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, change, reason FROM stock_movements "
+            "WHERE owner_id = ? AND batch_id = ? ORDER BY id",
+            (owner_id, batch_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, change, reason FROM stock_movements WHERE id = ?",
+            (last_id,),
+        ).fetchall()
+
+    undo_batch_id = new_batch_id()
+    results = []
+    for vendor, item, unit, change, reason in rows:
+        conn.execute(
+            "UPDATE stock SET qty = qty - ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+            (change, owner_id, vendor, item),
+        )
+        conn.execute(
+            "INSERT INTO stock_movements (owner_id, vendor_name, item_name, unit, change, reason, batch_id) "
+            "VALUES (?, ?, ?, ?, ?, 'undo', ?)",
+            (owner_id, vendor, item, unit, -change, undo_batch_id),
+        )
+        result = conn.execute(
+            "SELECT qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+            (owner_id, vendor, item),
+        ).fetchone()
+        new_qty = result[0] if result else -change
+        results.append((vendor, item, unit, new_qty, reason))
+
+    conn.commit()
+    return results
+
+
+def get_vendors(conn, owner_id):
+    """Distinct vendor names this owner has any stock record for — used to answer
+    "which vendors do I have" with real names instead of the bot guessing some."""
+    rows = conn.execute(
+        "SELECT DISTINCT vendor_name FROM stock WHERE owner_id = ? ORDER BY vendor_name",
+        (owner_id,),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def get_stock_for_vendor(conn, owner_id, vendor_name):

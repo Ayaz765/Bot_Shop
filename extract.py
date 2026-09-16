@@ -37,7 +37,10 @@ Rules:
 4. Capture each item's unit of measure (kg, g, litre, ml, pcs, box, bag, dozen, MT, etc.) in
    "unit" exactly as printed or abbreviated on the bill. If none is printed, use null — don't
    assume "pcs".
-5. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
+5. If this document has more than one page, it is still ONE bill: read every page in order and
+   put every item from every page into the same "items" array. Do not stop after page 1 — an
+   item table that continues onto page 2 is not optional reading.
+6. Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
 
 {
   "supplier_name": string or null,

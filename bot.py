@@ -15,6 +15,7 @@ merge them into one shared identity (person B's message finishing person A's
 flow). chat_id is still what messages get sent to; sender_id is who's mid-flow.
 """
 
+import base64
 import html
 import os
 import sys
@@ -37,6 +38,7 @@ FILE_ROOT = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 
 BOT_NAME = "LUMO"
+LOW_CONFIDENCE_THRESHOLD = 0.6  # same cutoff as checker.py's retired LOW_CONFIDENCE rule
 WELCOME = (
     "Kya karna hai?\n\n"
     "1️⃣ Read & Summarize Invoice — bill ki photo ya PDF bhejo, summary milega "
@@ -48,6 +50,11 @@ WELCOME = (
 user_names = {}  # (chat_id, sender_id) -> name, once they've told us
 awaiting_name = set()  # (chat_id, sender_id) currently expected to reply with their name
 pending_photo = {}  # (chat_id, sender_id) -> downloaded file path, if one arrived before we had a name
+
+CHAT_HISTORY_TURNS = 3  # past exchanges kept per person, so "isko"/"ye" resolve to what was just said
+chat_history = {}  # (chat_id, sender_id) -> [{"role": "user"|"model", "text": str}, ...], oldest first
+
+active_vendor = {}  # (chat_id, sender_id) -> vendor_name last talked about, so it doesn't need repeating
 
 awaiting_stock_vendor = set()  # (chat_id, sender_id) chose "Add to Stock", waiting for vendor name
 awaiting_stock_method = {}  # (chat_id, sender_id) -> vendor_name, waiting for photo-or-manual choice
@@ -109,18 +116,35 @@ chahiye — rate ki zarurat nahi. Isi JSON shape mein nikaalo, sirf JSON do, kuc
 Unit na bataya gaya ho to null rakho — mat maano "pcs" hai."""
 
 FREE_TEXT_SYSTEM_PROMPT = """Tum LUMO ho, ek Hinglish-bolne wala dukaan-stock-tracking bot. User \
-ka message padhkar uska intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
+ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to pehle dhyaan se suno, \
+Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
+baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "stock_query" | "chat", "items": [{"name": string, "qty": number, \
-"unit": string or null}], "vendor_name": string or null, "reply": string}
+{"intent": "sale" | "restock" | "stock_query" | "undo" | "chat", "items": [{"name": string, \
+"qty": number, "unit": string or null}], "vendor_name": string or null, "reply": string}
 
-- "sale": user ne bataya ki kuch becha/sold hua (jaise "5 kg Sugar becha", "10 pcs soap nikal \
-gaya"). items mein wo bharo, unit agar bataya ho. vendor_name sirf tab bharo jab usne khud \
-vendor ka naam liya ho.
+Is conversation ke pichle 1-2 messages bhi tumhe upar mil sakte hain. Agar user "isko", "ye", \
+"wahi wala" jaisa kuch bole, pehle wahi context dekho ki pichle message mein kaunsa item/vendor \
+zikar hua tha — khud se mat banao, agar context mein bhi na mile to null/khaali rakho.
+
+- "sale": user ne bataya ki kuch becha/sold/nikal gaya hai — maal DUKAAN SE BAAHAR ja raha hai. \
+Jaise "5 kg Sugar becha", "10 pcs soap nikal gaya". items mein wo bharo, unit agar bataya ho. \
+vendor_name bharo agar isi message ya pichle context se pata chale, warna null.
+- "restock": user ne bataya ki kisi vendor se naya maal AAYA hai aur stock mein jama/add karna \
+hai — maal DUKAAN MEIN AA raha hai. Jaise "Ramesh se 20 Maggi aaya", "iske paas Pizza hai isko \
+stock me add karo", "naya maal aaya hai". items mein wo bharo. vendor_name bharo agar isi message \
+ya pichle context se pata chale, warna null.
 - "stock_query": user kisi vendor ka stock/hisaab pooch raha hai (jaise "Ayaz ka stock batao", \
-"Ramesh se kya aaya hai"). vendor_name zaroor bharo.
-- "chat": baaki sab (greeting, casual baat, sawaal). "reply" mein chhota (1-2 line) dostana \
-Hinglish jawab do jaise ek dost deta hai."""
+"Ramesh se kya aaya hai") — tab vendor_name zaroor bharo. YA user saare vendors ki list maang \
+raha hai (jaise "kaun kaun se vendor hai", "sab vendor batao", "koi vendor ka naam bata") — tab \
+vendor_name null rakho, "chat" mat samjhna, ye bhi stock_query hai.
+- "undo": user keh raha hai ki abhi jo pichli entry hui (sale ya restock) wo galat thi, use wapas \
+karo. Jaise "galti ho gayi", "undo karo", "pichla wapas le lo", "cancel karo pichla wala". \
+items/vendor_name ki zarurat nahi.
+- "chat": baaki sab (greeting, casual baat, sawaal jiska jawab tumhare data mein nahi hai). \
+"reply" mein chhota (1-2 line) dostana Hinglish jawab do jaise ek dost deta hai. KABHI BHI koi \
+vendor ka naam, item ka naam, ya stock number khud se mat banao — tumhe pata nahi ki user ke \
+paas asal mein kaunse vendors/items hain, aur wo galat lag sakta hai."""
 
 NOT_A_NAME = {
     "hi", "hii", "hiii", "hiiii", "hello", "hey", "hey lumo", "hii lumo",
@@ -170,34 +194,70 @@ def answer_callback(callback_query_id):
 
 def format_summary_html(invoice):
     header = html.escape(invoice.get("supplier_name") or "Unknown Vendor")
+    meta_bits = []
     if invoice.get("invoice_number"):
-        header += f" — {html.escape(str(invoice['invoice_number']))}"
+        meta_bits.append(f"Bill #{html.escape(str(invoice['invoice_number']))}")
     if invoice.get("invoice_date"):
-        header += f" ({html.escape(str(invoice['invoice_date']))})"
+        meta_bits.append(html.escape(str(invoice["invoice_date"])))
 
-    lines = [f"<b>{header}</b>", ""]
-    for item in invoice.get("items", []):
-        parts = [html.escape(item.get("name") or "")]
-        if item.get("qty") is not None:
-            parts.append(f"qty {fmt_qty(item['qty'], item.get('unit'))}")
-        if item.get("rate") is not None:
-            parts.append(f"rate Rs{item['rate']:g}")
-        if item.get("amount") is not None:
-            parts.append(f"= Rs{item['amount']:g}")
-        lines.append("• " + " — ".join(parts))
+    lines = [f"🧾 <b>{header}</b>"]
+    if meta_bits:
+        lines.append(" · ".join(meta_bits))
+    lines.append("")
+
+    warning = confidence_warning(invoice)
+    if warning:
+        lines.append(warning)
+        lines.append("")
+
+    for i, item in enumerate(invoice.get("items", []), start=1):
+        lines.append(f"{i}. <b>{html.escape(item.get('name') or '?')}</b>")
+        qty, rate, amount = item.get("qty"), item.get("rate"), item.get("amount")
+        if qty is not None and rate is not None:
+            detail = f"{fmt_qty(qty, item.get('unit'))} × Rs{fmt_money(rate)}"
+            if amount is not None:
+                detail += f" = Rs{fmt_money(amount)}"
+        elif qty is not None:
+            detail = fmt_qty(qty, item.get("unit"))
+        elif amount is not None:
+            detail = f"Rs{fmt_money(amount)}"
+        else:
+            detail = "detail nahi mila"
+        lines.append(f"    ↳ {detail}")
 
     lines.append("")
+    lines.append("────────────")
     if invoice.get("sub_total") is not None:
-        lines.append(f"Sub total: Rs{invoice['sub_total']:.2f}")
+        lines.append(f"Sub total: Rs{fmt_money(invoice['sub_total'])}")
     if invoice.get("tax") is not None:
-        lines.append(f"Tax: Rs{invoice['tax']:.2f}")
+        lines.append(f"Tax: Rs{fmt_money(invoice['tax'])}")
     if invoice.get("grand_total") is not None:
-        lines.append(f"<b>Grand total: Rs{invoice['grand_total']:.2f}</b>")
+        lines.append(f"<b>Grand total: Rs{fmt_money(invoice['grand_total'])}</b>")
     return "\n".join(lines)
+
+
+def confidence_warning(invoice):
+    """Honest 'couldn't read this' beats a confidently wrong number (see CLAUDE.md).
+    Returns a Hinglish caveat line, or None if the extraction looked trustworthy."""
+    confidence = invoice.get("confidence")
+    if confidence is not None and confidence < LOW_CONFIDENCE_THRESHOLD:
+        return "⚠️ Photo saaf nahi thi, kuch numbers galat ho sakte hain. Bill se ek baar milaa lena."
+    unreadable = invoice.get("unreadable_fields")
+    if unreadable:
+        fields = ", ".join(html.escape(str(f)) for f in unreadable)
+        return f"⚠️ Ye padh nahi paya: {fields}. Bill par khud check kar lena."
+    return None
 
 
 def fmt_qty(qty, unit):
     return f"{qty:g} {unit}" if unit else f"{qty:g}"
+
+
+def fmt_money(amount):
+    """Thousands separator + trims a bare .00, so bills read like a bill
+    (Rs3,072) instead of a raw float dump (Rs3072.00 or Rs3072.0)."""
+    text = f"{amount:,.2f}"
+    return text[:-3] if text.endswith(".00") else text
 
 
 def format_stock_confirmation(vendor_name, items):
@@ -209,28 +269,65 @@ def format_stock_confirmation(vendor_name, items):
     return "\n".join(lines)
 
 
-def interpret_free_text(text):
-    """One Gemini call classifies + extracts: sale, stock lookup, or plain chat —
-    avoids a separate detect-then-reply pair of calls on every ordinary message."""
+def _classify_with_history(user_part, history_label, ukey):
+    """Shared Gemini call behind interpret_free_text/interpret_voice — builds the
+    contents list from this person's chat_history (so pronouns like "isko"/"ye"
+    resolve against what was actually said, not just the current line alone),
+    appends the new turn, then records the exchange back into chat_history.
+    history_label is what gets stored as this turn's "user" text — the raw text
+    itself for typed messages, a placeholder for voice notes (no separate
+    transcript is kept, just Gemini's structured reply)."""
     key = os.environ.get("GEMINI_API_KEY")
+    contents = [
+        {"role": turn["role"], "parts": [{"text": turn["text"]}]}
+        for turn in chat_history.get(ukey, [])
+    ] if ukey is not None else []
+    contents.append({"role": "user", "parts": [user_part]})
+
     resp = requests.post(
         f"{extract.GEMINI_API_ROOT}/models/{extract.DEFAULT_GEMINI_MODEL}:generateContent",
         params={"key": key},
         json={
             "system_instruction": {"parts": [{"text": FREE_TEXT_SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": text}]}],
+            "contents": contents,
         },
     )
     resp.raise_for_status()
-    return extract._parse_json_response(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+    reply_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    if ukey is not None:
+        history = chat_history.setdefault(ukey, [])
+        history.append({"role": "user", "text": history_label})
+        history.append({"role": "model", "text": reply_text})
+        del history[:-(CHAT_HISTORY_TURNS * 2)]
+
+    return extract._parse_json_response(reply_text)
 
 
-def answer_question(text):
+def interpret_free_text(text, ukey=None):
+    """One Gemini call classifies + extracts: sale, restock, stock lookup, or plain
+    chat — avoids a separate detect-then-reply pair of calls on every ordinary
+    message."""
+    return _classify_with_history({"text": text}, text, ukey)
+
+
+def interpret_voice(file_path, mime_type, ukey=None):
+    """Voice-note version of interpret_free_text — Gemini listens and classifies
+    in the same call, no separate transcription step. Typing is real effort for a
+    shopkeeper standing at the counter; speaking "5 Maggi becha" is lighter, and
+    CLAUDE.md's whole point is that input must get lighter, never heavier."""
+    with open(file_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+    part = {"inline_data": {"mime_type": mime_type, "data": audio_b64}}
+    return _classify_with_history(part, "[voice message]", ukey)
+
+
+def answer_question(text, ukey=None):
     """Natural-language answer for a question asked mid-flow (e.g. someone stuck
     at 'what's your name?' asks 'what does this do?' instead). Reuses the same
     classifier as the main fallback — its 'reply' field stands alone fine here."""
     try:
-        result = interpret_free_text(text)
+        result = interpret_free_text(text, ukey)
         return result.get("reply") or "Bas thoda sa detail chahiye, phir aage badhte hain."
     except Exception:
         return "Bas thoda sa detail chahiye, phir aage badhte hain."
@@ -245,23 +342,69 @@ def format_stock_report(vendor_name, items):
     return "\n".join(lines)
 
 
+def _same_vendor(a, b):
+    return bool(a) and bool(b) and a.strip().lower() == b.strip().lower()
+
+
+REASON_LABELS = {"sale": "sale", "delivery": "stock add", "undo": "undo"}
+
+
+def handle_undo(ukey):
+    chat_id, owner_id = ukey
+    conn = db.get_connection()
+    results = db.undo_last_movement(conn, owner_id)
+    if not results:
+        send_message(chat_id, "Wapas lene ke liye koi entry mili nahi.")
+        return
+
+    reasons = {reason for *_, reason in results}
+    label = REASON_LABELS.get(next(iter(reasons)), "entry") if len(reasons) == 1 else "entry"
+    lines = [f"Theek hai, pichla {label} wapas le liya:", ""]
+    for vendor, item, unit, new_qty, _reason in results:
+        active_vendor[ukey] = vendor
+        lines.append(f"• <b>{html.escape(item)}</b>: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
+    send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
 def handle_stock_query(ukey, vendor_name):
     chat_id, owner_id = ukey
-    if not vendor_name:
-        send_message(chat_id, "Kaunse vendor ka stock dekhna hai?", reply_markup=MAIN_MENU)
-        return
     conn = db.get_connection()
+    if not vendor_name:
+        vendors = db.get_vendors(conn, owner_id)
+        if not vendors:
+            send_message(chat_id, "Abhi koi vendor record nahi hai mere paas.")
+        else:
+            names = ", ".join(html.escape(v) for v in vendors)
+            send_message(chat_id, f"Ye vendors hain: {names}. Kiska stock dekhna hai?")
+        return
+    active_vendor[ukey] = vendor_name
     items = db.get_stock_for_vendor(conn, owner_id, vendor_name)
-    send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML", reply_markup=MAIN_MENU)
+    send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML")
+
+
+LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
+
+
+def _sale_line(matched_item, new_qty, matched_unit, vendor, qty_sold):
+    line = f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})"
+    qty_before = new_qty + qty_sold
+    if new_qty < 0:
+        line += "\n   ⚠️ Itna stock tha hi nahi, phir bhi kaat diya — ek baar check kar lena."
+    elif new_qty <= LOW_STOCK_THRESHOLD < qty_before:
+        # only fires the sale that crosses the line, not every sale after — otherwise
+        # every subsequent sale of an already-low item would repeat the same nudge
+        line += f"\n   📉 Kam bacha hai ({fmt_qty(new_qty, matched_unit)}), mangwa lena."
+    return line
 
 
 def handle_sale(ukey, items, vendor_name):
     chat_id, owner_id = ukey
     if not items:
-        send_message(chat_id, "Samajh nahi aaya kya becha. Phir se batao?", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Samajh nahi aaya kya becha. Phir se batao?")
         return
 
     conn = db.get_connection()
+    batch_id = db.new_batch_id()  # all items from this one message undo together
     lines = []
     for item in items:
         name, qty, unit = item.get("name"), item.get("qty"), item.get("unit")
@@ -269,17 +412,26 @@ def handle_sale(ukey, items, vendor_name):
             continue
 
         if vendor_name:
-            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, vendor_name, name, qty, unit)
-            lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
+            result = db.record_sale(conn, owner_id, vendor_name, name, qty, unit, batch_id)
+            if result is None:
+                lines.append(f"• {html.escape(name)}: {html.escape(vendor_name)} ke paas ye stock mein nahi mila.")
+            else:
+                vendor, matched_item, matched_unit, new_qty = result
+                active_vendor[ukey] = vendor
+                lines.append(_sale_line(matched_item, new_qty, matched_unit, vendor, qty))
             continue
 
         matches = db.find_item_across_vendors(conn, owner_id, name)
+        current = active_vendor.get(ukey)
+        active_match = next((m for m in matches if _same_vendor(m["vendor_name"], current)), None)
+
         if not matches:
             lines.append(f"• {html.escape(name)}: ye stock mein nahi mila.")
-        elif len(matches) == 1:
-            m = matches[0]
-            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, m["vendor_name"], m["item_name"], qty, unit)
-            lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})")
+        elif len(matches) == 1 or active_match:
+            m = active_match or matches[0]
+            vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, m["vendor_name"], m["item_name"], qty, unit, batch_id)
+            active_vendor[ukey] = vendor
+            lines.append(_sale_line(matched_item, new_qty, matched_unit, vendor, qty))
         else:
             vendors = " / ".join(html.escape(m["vendor_name"]) for m in matches)
             example = matches[0]["vendor_name"]
@@ -288,7 +440,42 @@ def handle_sale(ukey, items, vendor_name):
                 f"Jaise likho: \"{example} ka {html.escape(name)} becha\""
             )
 
-    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML", reply_markup=MAIN_MENU)
+    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML")
+
+
+def handle_restock(ukey, items, vendor_name):
+    """Free-text version of the Add-to-Stock flow (db.add_stock, not record_sale) —
+    "iske paas Maggi aaya, stock me add karo" was previously misread as a sale and
+    silently decremented stock instead of adding it."""
+    chat_id, owner_id = ukey
+    if not items:
+        send_message(chat_id, "Samajh nahi aaya kya aaya. Phir se batao?")
+        return
+    vendor_name = vendor_name or active_vendor.get(ukey)
+    if not vendor_name:
+        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+        return
+
+    conn = db.get_connection()
+    batch_id = db.new_batch_id()  # all items from this one message undo together
+    lines = []
+    missing_qty = []
+    for item in items:
+        name, qty, unit = item.get("name"), item.get("qty"), item.get("unit")
+        if not name:
+            continue
+        if not qty:
+            missing_qty.append(name)
+            continue
+        vendor, matched_item, matched_unit, new_qty = db.add_stock(conn, owner_id, vendor_name, name, qty, unit, batch_id)
+        active_vendor[ukey] = vendor
+        lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} ({html.escape(vendor)})")
+
+    if missing_qty:
+        names = ", ".join(html.escape(n) for n in missing_qty)
+        lines.append(f"⚠️ {names} — kitna aaya nahi bataya, quantity ke saath phir se batao.")
+
+    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML")
 
 
 def extract_stock_items(text):
@@ -332,6 +519,17 @@ def save_incoming_document(message):
     return path
 
 
+def save_incoming_voice(message):
+    """Telegram voice notes come as OGG/Opus — Gemini accepts that mime type
+    directly as inline_data, no local conversion needed."""
+    voice = message["voice"]
+    os.makedirs("bot_uploads", exist_ok=True)
+    file_id = voice["file_id"]
+    path = f"bot_uploads/{file_id}.ogg"
+    download_file(file_id, path)
+    return path, voice.get("mime_type") or "audio/ogg"
+
+
 def process_summarize(ukey, file_path):
     chat_id = ukey[0]
     send_message(chat_id, f"{user_names[ukey]}, padh raha hoon...")
@@ -343,11 +541,11 @@ def process_summarize(ukey, file_path):
             invoice.get("invoice_date"), invoice.get("grand_total"),
             invoice.get("items", []), [],
         )
-        send_message(chat_id, format_summary_html(invoice), parse_mode="HTML", reply_markup=MAIN_MENU)
+        send_message(chat_id, format_summary_html(invoice), parse_mode="HTML")
     except Exception:
         import traceback
         traceback.print_exc()
-        send_message(chat_id, "Padhne mein dikkat aayi, dobara try karo.", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Padhne mein dikkat aayi, dobara try karo.")
 
 
 def process_stock_photo(ukey, vendor_name, file_path):
@@ -402,11 +600,13 @@ def confirm_stock_addition(ukey):
     chat_id, owner_id = ukey
     data = pending_stock_confirmation.pop(ukey)
     conn = db.get_connection()
+    batch_id = db.new_batch_id()  # all items from this one confirmation undo together
     lines = ["<b>Stock update ho gaya:</b>", ""]
     for item in data["items"]:
-        vendor, name, unit, new_qty = db.add_stock(conn, owner_id, data["vendor_name"], item["name"], item["qty"], item.get("unit"))
+        vendor, name, unit, new_qty = db.add_stock(conn, owner_id, data["vendor_name"], item["name"], item["qty"], item.get("unit"), batch_id)
+        active_vendor[ukey] = vendor
         lines.append(f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
-    send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
+    send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 def handle_callback_query(cq):
@@ -445,7 +645,7 @@ def handle_callback_query(cq):
 
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
         pending_stock_confirmation.pop(ukey, None)
-        send_message(chat_id, "Theek hai, cancel kar diya.", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Theek hai, cancel kar diya.")
 
 
 def handle_update(update):
@@ -456,7 +656,7 @@ def handle_update(update):
     print(f"DEBUG update: ukey={ukey} keys={list(message.keys())} text={message.get('text')!r}", flush=True)
     if not chat_id:
         return
-    if "text" not in message and "photo" not in message and "document" not in message:
+    if "text" not in message and "photo" not in message and "document" not in message and "voice" not in message:
         return  # ignore group system messages: joins, leaves, pins, etc.
 
     # New sender in this chat: check for a saved name first (survives restarts),
@@ -470,7 +670,7 @@ def handle_update(update):
         elif ukey in awaiting_name and "text" in message:
             name = message["text"].strip()
             if looks_like_question(name):
-                send_message(chat_id, answer_question(name))
+                send_message(chat_id, answer_question(name, ukey))
                 send_message(chat_id, "Ab apna naam bata do?")
                 return
             if name.lower() in NOT_A_NAME or name in ALL_BUTTON_TEXTS:
@@ -502,7 +702,7 @@ def handle_update(update):
     if "photo" in message or "document" in message:
         file_path = save_incoming_photo(message) if "photo" in message else save_incoming_document(message)
         if not file_path:
-            send_message(chat_id, "Ye file PDF ya image nahi lagi.", reply_markup=MAIN_MENU)
+            send_message(chat_id, "Ye file PDF ya image nahi lagi.")
             return
         if ukey in awaiting_stock_photo:
             vendor_name = awaiting_stock_photo[ukey]
@@ -510,6 +710,21 @@ def handle_update(update):
                 awaiting_stock_photo.pop(ukey, None)
         else:
             process_summarize(ukey, file_path)
+        return
+
+    # Voice note: only wired into the free-text path (sale/restock/stock_query/
+    # undo/chat) — not into the structured Add-to-Stock button flow's typed
+    # prompts (vendor name, item list), which still need text for now.
+    if "voice" in message:
+        file_path, mime_type = save_incoming_voice(message)
+        try:
+            result = interpret_voice(file_path, mime_type, ukey)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            send_message(chat_id, f"{user_names[ukey]}, awaaz samajh nahi aayi. Phir se bolo ya type kar do.")
+            return
+        dispatch_intent(ukey, result)
         return
 
     text = message["text"].strip()
@@ -527,7 +742,7 @@ def handle_update(update):
         send_message(chat_id, "Vendor ka naam likho (button nahi), jaise: Ayaz")
 
     elif ukey in awaiting_stock_vendor and looks_like_question(text):
-        send_message(chat_id, answer_question(text))
+        send_message(chat_id, answer_question(text, ukey))
         send_message(chat_id, "Ab batao, kaunse vendor se maal aaya?")
 
     elif ukey in awaiting_stock_vendor:
@@ -546,7 +761,7 @@ def handle_update(update):
         send_message(chat_id, 'Batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"', reply_markup=NO_KEYBOARD)
 
     elif ukey in awaiting_stock_manual_text and looks_like_question(text):
-        send_message(chat_id, answer_question(text))
+        send_message(chat_id, answer_question(text, ukey))
         send_message(chat_id, 'Ab batao kya-kya aaya, jaise:\n"Biscuit 20 pcs, Soap 10 pcs"')
 
     elif ukey in awaiting_stock_manual_text:
@@ -559,27 +774,39 @@ def handle_update(update):
 
     elif ukey in pending_stock_confirmation and (text == BTN_NO or text.lower() in NO_WORDS):
         pending_stock_confirmation.pop(ukey)
-        send_message(chat_id, "Theek hai, cancel kar diya.", reply_markup=MAIN_MENU)
+        send_message(chat_id, "Theek hai, cancel kar diya.")
 
     elif ukey in pending_stock_confirmation:
         send_message(chat_id, "Haan ya nahi bata do — stock mein add karna hai?", reply_markup=CONFIRM_MENU)
 
     else:
         try:
-            result = interpret_free_text(text)
+            result = interpret_free_text(text, ukey)
         except Exception:
             import traceback
             traceback.print_exc()
             send_message(chat_id, f"{user_names[ukey]}, {WELCOME}", reply_markup=MAIN_MENU)
             return
+        dispatch_intent(ukey, result)
 
-        intent = result.get("intent")
-        if intent == "stock_query":
-            handle_stock_query(ukey, result.get("vendor_name"))
-        elif intent == "sale":
-            handle_sale(ukey, result.get("items", []), result.get("vendor_name"))
-        else:
-            send_message(chat_id, result.get("reply") or WELCOME, reply_markup=MAIN_MENU)
+
+def dispatch_intent(ukey, result):
+    """Routes a classified result (from typed text or a voice note — same JSON
+    shape either way) to the right handler. Shared so voice messages get exactly
+    the same sale/restock/stock_query/undo/chat behavior as typed ones."""
+    chat_id = ukey[0]
+    intent = result.get("intent")
+    if intent == "stock_query":
+        handle_stock_query(ukey, result.get("vendor_name"))
+    elif intent == "sale":
+        handle_sale(ukey, result.get("items", []), result.get("vendor_name"))
+    elif intent == "restock":
+        handle_restock(ukey, result.get("items", []), result.get("vendor_name"))
+    elif intent == "undo":
+        handle_undo(ukey)
+    else:
+        reply = result.get("reply")
+        send_message(chat_id, reply or WELCOME, reply_markup=None if reply else MAIN_MENU)
 
 
 def main():
