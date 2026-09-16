@@ -530,3 +530,46 @@ def get_stock_for_vendor(conn, owner_id, vendor_name):
         (owner_id, vendor),
     ).fetchall()
     return [{"item_name": r[0], "unit": r[1], "qty": r[2]} for r in rows]
+
+
+def get_stock_with_last_delivery(conn, owner_id, vendor_name):
+    """Same as get_stock_for_vendor, but each item also carries "last_delivery"
+    — the raw UTC timestamp string of its most recent 'delivery' movement, or
+    None if it's never been restocked (e.g. added only via a sale-side merge).
+    Lets the stock list answer "ye kab aaya tha" without a separate query."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+    if not vendor:
+        return []
+    rows = conn.execute(
+        "SELECT item_name, unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? ORDER BY item_name",
+        (owner_id, vendor),
+    ).fetchall()
+    dates = dict(conn.execute(
+        "SELECT item_name, MAX(created_at) FROM stock_movements "
+        "WHERE owner_id = ? AND vendor_name = ? AND reason = 'delivery' GROUP BY item_name",
+        (owner_id, vendor),
+    ).fetchall())
+    return [{"item_name": r[0], "unit": r[1], "qty": r[2], "last_delivery": dates.get(r[0])} for r in rows]
+
+
+def get_delivery_history(conn, owner_id, vendor_name=None, limit=30):
+    """Recent deliveries (reason='delivery' movements), newest first — answers
+    "kis din kya aaya kis vendor se". Optionally scoped to one (fuzzy-resolved)
+    vendor; None means across all of this owner's vendors."""
+    if vendor_name:
+        vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+        if not vendor:
+            return []
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, change, created_at FROM stock_movements "
+            "WHERE owner_id = ? AND vendor_name = ? AND reason = 'delivery' "
+            "ORDER BY id DESC LIMIT ?",
+            (owner_id, vendor, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, change, created_at FROM stock_movements "
+            "WHERE owner_id = ? AND reason = 'delivery' ORDER BY id DESC LIMIT ?",
+            (owner_id, limit),
+        ).fetchall()
+    return [{"vendor_name": r[0], "item_name": r[1], "unit": r[2], "qty": r[3], "created_at": r[4]} for r in rows]

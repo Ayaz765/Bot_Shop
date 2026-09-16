@@ -61,6 +61,7 @@ awaiting_stock_method = {}  # (chat_id, sender_id) -> vendor_name, waiting for p
 awaiting_stock_photo = {}  # (chat_id, sender_id) -> vendor_name, waiting for the delivery photo
 awaiting_stock_manual_text = {}  # (chat_id, sender_id) -> vendor_name, waiting for typed item list
 pending_stock_confirmation = {}  # (chat_id, sender_id) -> {"vendor_name", "items"}, waiting yes/no
+awaiting_photo_purpose = {}  # (chat_id, sender_id) -> (vendor_name, file_path), waiting "stock ya summary?"
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
@@ -83,6 +84,13 @@ CONFIRM_MENU = {"inline_keyboard": [
     [{"text": BTN_NO, "callback_data": "confirm_no"}],
 ]}
 
+BTN_PHOTO_FOR_STOCK = "📦 Stock mein add karo"
+BTN_PHOTO_FOR_SUMMARY = "🧾 Sirf summary chahiye"
+PHOTO_PURPOSE_MENU = {"inline_keyboard": [
+    [{"text": BTN_PHOTO_FOR_STOCK, "callback_data": "photo_purpose_stock"}],
+    [{"text": BTN_PHOTO_FOR_SUMMARY, "callback_data": "photo_purpose_summary"}],
+]}
+
 # Inline buttons attach to one message and never take over the keyboard area, so
 # there's nothing to "remove" the way a ReplyKeyboardMarkup panel needs — that panel
 # was the actual bug (stays open until the user manually taps back to their keyboard).
@@ -90,6 +98,7 @@ NO_KEYBOARD = None
 
 ALL_BUTTON_TEXTS = {
     BTN_SUMMARIZE, BTN_STOCK, BTN_STOCK_PHOTO, BTN_STOCK_MANUAL, BTN_YES, BTN_NO,
+    BTN_PHOTO_FOR_STOCK, BTN_PHOTO_FOR_SUMMARY,
 }
 
 YES_WORDS = {"haan", "ha", "han", "yes", "y", "ok", "okay", "theek hai", "kar do", "add karo"}
@@ -105,6 +114,7 @@ def clear_stock_flow(ukey):
     awaiting_stock_photo.pop(ukey, None)
     awaiting_stock_manual_text.pop(ukey, None)
     pending_stock_confirmation.pop(ukey, None)
+    awaiting_photo_purpose.pop(ukey, None)
 
 
 STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
@@ -120,9 +130,9 @@ ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to peh
 Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
 baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "chat", "items": [{"name": \
-string, "qty": number or null, "unit": string or null, "all": boolean}], "vendor_name": string \
-or null, "old_name": string or null, "new_name": string or null, "reply": string}
+{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "history" | "chat", "items": \
+[{"name": string, "qty": number or null, "unit": string or null, "all": boolean}], "vendor_name": \
+string or null, "old_name": string or null, "new_name": string or null, "reply": string}
 
 Is conversation ke pichle 1-2 messages bhi tumhe upar mil sakte hain. Agar user "isko", "ye", \
 "wahi wala" jaisa kuch bole, pehle wahi context dekho ki pichle message mein kaunsa item/vendor \
@@ -145,6 +155,10 @@ vendor_name null rakho, "chat" mat samjhna, ye bhi stock_query hai.
 - "undo": user keh raha hai ki abhi jo pichli entry hui (sale ya restock) wo galat thi, use wapas \
 karo. Jaise "galti ho gayi", "undo karo", "pichla wapas le lo", "cancel karo pichla wala". \
 items/vendor_name ki zarurat nahi.
+- "history": user delivery ka purana record poochh raha hai — kis din kya aaya (jaise "Karan ka \
+history dikhao", "kab kya aaya", "delivery record batao", "pichle hafte kya aaya"). Ye sirf naya \
+maal AANE (restock) ka record hai, sale ka nahi. vendor_name bharo agar specific vendor ho, warna \
+null (sab vendors ka record).
 - "rename": kisi item ka naam galat likha/bola gaya tha, use theek karna hai (typo, galat OCR, \
 galat suna gaya). Jaise "Maggie ka naam Maggi kar do", "iska sahi naam XYZ hai", "naam galat hai, \
 ise ABC bolo". old_name mein purana (galat) naam, new_name mein sahi naam bharo. vendor_name bharo \
@@ -185,6 +199,17 @@ def time_greeting():
     if hour < 17:
         return "Good afternoon"
     return "Good evening"
+
+
+def _format_ist_date(utc_timestamp):
+    """stock_movements.created_at is SQLite's CURRENT_TIMESTAMP — naive UTC.
+    Converting to IST before showing a date matters for the same reason as
+    time_greeting: a delivery logged at 2am IST is 8:30pm UTC the PREVIOUS
+    day, so showing the raw UTC date would make it look like "yesterday"."""
+    if not utc_timestamp:
+        return None
+    dt = datetime.strptime(utc_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%d %b")
 
 
 def send_message(chat_id, text, parse_mode=None, reply_markup=None):
@@ -379,7 +404,11 @@ def format_stock_report(vendor_name, items):
         elif qty <= LOW_STOCK_THRESHOLD:
             marker = " 📉"
             low_count += 1
-        rows.append(f"{_pad(item['item_name'], name_width)}  {fmt_qty(qty, item.get('unit'))}{marker}")
+        row = f"{_pad(item['item_name'], name_width)}  {fmt_qty(qty, item.get('unit'))}{marker}"
+        last_delivery = _format_ist_date(item.get("last_delivery"))
+        if last_delivery:
+            row += f"  · {last_delivery}"
+        rows.append(row)
 
     summary = f"Total {len(items)} item"
     if low_count:
@@ -434,7 +463,7 @@ def handle_undo(ukey):
     entries = []
     for vendor, item, unit, new_qty, _reason in results:
         active_vendor[ukey] = vendor
-        entries.append((vendor, f"• <b>{html.escape(item)}</b>: ab {fmt_qty(new_qty, unit)}"))
+        entries.append((vendor, f"• <b>{html.escape(item)}</b>: {fmt_qty(new_qty, unit)}"))
     body = _format_grouped(entries)
     send_message(chat_id, f"Theek hai, pichla {label} wapas le liya:\n\n{body}", parse_mode="HTML")
 
@@ -476,15 +505,44 @@ def handle_stock_query(ukey, vendor_name):
             send_message(chat_id, f"Ye vendors hain: {names}. Kiska stock dekhna hai?")
         return
     active_vendor[ukey] = vendor_name
-    items = db.get_stock_for_vendor(conn, owner_id, vendor_name)
+    items = db.get_stock_with_last_delivery(conn, owner_id, vendor_name)
     send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML")
+
+
+def handle_history(ukey, vendor_name):
+    """vendor_name=None means "across all vendors" (like stock_query's vendor
+    list) — no active_vendor fallback here, since that would silently narrow
+    an explicit "sab vendors ka record dikhao" down to just one."""
+    chat_id, owner_id = ukey
+    conn = db.get_connection()
+    rows = db.get_delivery_history(conn, owner_id, vendor_name, limit=30)
+    if not rows:
+        send_message(chat_id, "Abhi koi delivery record nahi hai mere paas.")
+        return
+    if vendor_name:
+        active_vendor[ukey] = vendor_name
+
+    by_date = {}
+    for r in rows:
+        label = _format_ist_date(r["created_at"]) or "?"
+        line = f"• {html.escape(r['item_name'])} — {fmt_qty(r['qty'], r['unit'])}"
+        if not vendor_name:  # scoped to one vendor already says who; across all, say each time
+            line += f" ({html.escape(r['vendor_name'])})"
+        by_date.setdefault(label, []).append(line)
+
+    out = []
+    for label, item_lines in by_date.items():
+        out.append(f"<b>{label}:</b>")
+        out.extend(item_lines)
+        out.append("")
+    send_message(chat_id, "\n".join(out).rstrip(), parse_mode="HTML")
 
 
 LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
 
 
 def _sale_line(matched_item, new_qty, matched_unit, qty_sold):
-    line = f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha"
+    line = f"• {html.escape(matched_item)}: {fmt_qty(new_qty, matched_unit)} bacha"
     qty_before = new_qty + qty_sold
     if new_qty < 0:
         line += "\n   ⚠️ Itna stock tha hi nahi, phir bhi kaat diya — ek baar check kar lena."
@@ -595,7 +653,7 @@ def handle_restock(ukey, items, vendor_name):
         vendor, matched_item, matched_unit, new_qty = db.add_stock(conn, owner_id, vendor_name, name, qty, unit, batch_id)
         active_vendor[ukey] = vendor
         resolved_vendor = vendor
-        lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)}")
+        lines.append(f"• {html.escape(matched_item)}: {fmt_qty(new_qty, matched_unit)}")
 
     parts = []
     if lines:
@@ -736,7 +794,7 @@ def confirm_stock_addition(ukey):
         vendor, name, unit, new_qty = db.add_stock(conn, owner_id, data["vendor_name"], item["name"], item["qty"], item.get("unit"), batch_id)
         active_vendor[ukey] = vendor
         resolved_vendor = vendor
-        line = f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)}"
+        line = f"• {html.escape(name)}: {fmt_qty(new_qty, unit)}"
         if item.get("rate") is not None:
             line += f" (Rs{fmt_money(item['rate'])}/each)"
         lines.append(line)
@@ -781,6 +839,14 @@ def handle_callback_query(cq):
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
         pending_stock_confirmation.pop(ukey, None)
         send_message(chat_id, "Theek hai, cancel kar diya.")
+
+    elif data == "photo_purpose_stock" and ukey in awaiting_photo_purpose:
+        vendor_name, file_path = awaiting_photo_purpose.pop(ukey)
+        process_stock_photo(ukey, vendor_name, file_path)
+
+    elif data == "photo_purpose_summary" and ukey in awaiting_photo_purpose:
+        _, file_path = awaiting_photo_purpose.pop(ukey)
+        process_summarize(ukey, file_path)
 
 
 def handle_update(update):
@@ -843,6 +909,18 @@ def handle_update(update):
             vendor_name = awaiting_stock_photo[ukey]
             if process_stock_photo(ukey, vendor_name, file_path):
                 awaiting_stock_photo.pop(ukey, None)
+        elif active_vendor.get(ukey):
+            # An unprompted photo with a vendor already "in focus" (from earlier
+            # free-text stock chat) is genuinely ambiguous — silently defaulting
+            # to Read & Summarize meant a photo meant for stock never got added,
+            # with no clue why. Ask once instead of guessing either way.
+            awaiting_photo_purpose[ukey] = (active_vendor[ukey], file_path)
+            send_message(
+                chat_id,
+                f"Ye photo <b>{html.escape(active_vendor[ukey])}</b> ke stock mein add karni hai, "
+                f"ya sirf padh ke summary chahiye?",
+                parse_mode="HTML", reply_markup=PHOTO_PURPOSE_MENU,
+            )
         else:
             process_summarize(ukey, file_path)
         return
@@ -914,6 +992,17 @@ def handle_update(update):
     elif ukey in pending_stock_confirmation:
         send_message(chat_id, "Haan ya nahi bata do — stock mein add karna hai?", reply_markup=CONFIRM_MENU)
 
+    elif ukey in awaiting_photo_purpose and (text == BTN_PHOTO_FOR_STOCK or "stock" in text.lower()):
+        vendor_name, file_path = awaiting_photo_purpose.pop(ukey)
+        process_stock_photo(ukey, vendor_name, file_path)
+
+    elif ukey in awaiting_photo_purpose and (text == BTN_PHOTO_FOR_SUMMARY or "summar" in text.lower()):
+        _, file_path = awaiting_photo_purpose.pop(ukey)
+        process_summarize(ukey, file_path)
+
+    elif ukey in awaiting_photo_purpose:
+        send_message(chat_id, "Stock mein add karna hai ya sirf summary chahiye?", reply_markup=PHOTO_PURPOSE_MENU)
+
     else:
         try:
             result = interpret_free_text(text, ukey)
@@ -941,6 +1030,8 @@ def dispatch_intent(ukey, result):
         handle_undo(ukey)
     elif intent == "rename":
         handle_rename(ukey, result.get("old_name"), result.get("new_name"), result.get("vendor_name"))
+    elif intent == "history":
+        handle_history(ukey, result.get("vendor_name"))
     else:
         reply = result.get("reply")
         send_message(chat_id, reply or WELCOME, reply_markup=None if reply else MAIN_MENU)
