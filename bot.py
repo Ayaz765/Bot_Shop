@@ -1,4 +1,4 @@
-"""Telegram front end (LUMO): read/summarize invoices and track per-vendor stock.
+"""Telegram front end (Genie): read/summarize invoices and track per-vendor stock.
 Long-polls the Telegram Bot API directly via requests — no new dependency.
 
 Two menu paths:
@@ -37,7 +37,7 @@ API_ROOT = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_ROOT = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 
-BOT_NAME = "LUMO"
+BOT_NAME = "Genie"
 LOW_CONFIDENCE_THRESHOLD = 0.6  # same cutoff as checker.py's retired LOW_CONFIDENCE rule
 WELCOME = (
     "Kya karna hai?\n\n"
@@ -125,7 +125,7 @@ chahiye — rate ki zarurat nahi. Isi JSON shape mein nikaalo, sirf JSON do, kuc
 
 Unit na bataya gaya ho to null rakho — mat maano "pcs" hai."""
 
-FREE_TEXT_SYSTEM_PROMPT = """Tum LUMO ho, ek Hinglish-bolne wala dukaan-stock-tracking bot. User \
+FREE_TEXT_SYSTEM_PROMPT = """Tum Genie ho, ek Hinglish-bolne wala dukaan-stock-tracking bot. User \
 ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to pehle dhyaan se suno, \
 Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
 baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
