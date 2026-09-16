@@ -493,6 +493,23 @@ def undo_last_movement(conn, owner_id):
     return results
 
 
+def get_item_qty(conn, owner_id, vendor_name, item_name):
+    """Current on-hand qty for one (fuzzy-resolved) vendor+item, or None if it
+    doesn't exist. Used to resolve "sara/pura bik gaya" (sold everything) into
+    a real number pulled from the ledger — not a guessed one."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+    if not vendor:
+        return None
+    item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
+    if item is None:
+        return None
+    row = conn.execute(
+        "SELECT qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (owner_id, vendor, item),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def get_vendors(conn, owner_id):
     """Distinct vendor names this owner has any stock record for — used to answer
     "which vendors do I have" with real names instead of the bot guessing some."""
