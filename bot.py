@@ -20,7 +20,7 @@ import html
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -120,8 +120,9 @@ ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to peh
 Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
 baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "restock" | "stock_query" | "undo" | "chat", "items": [{"name": string, \
-"qty": number, "unit": string or null}], "vendor_name": string or null, "reply": string}
+{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "chat", "items": [{"name": \
+string, "qty": number, "unit": string or null}], "vendor_name": string or null, \
+"old_name": string or null, "new_name": string or null, "reply": string}
 
 Is conversation ke pichle 1-2 messages bhi tumhe upar mil sakte hain. Agar user "isko", "ye", \
 "wahi wala" jaisa kuch bole, pehle wahi context dekho ki pichle message mein kaunsa item/vendor \
@@ -141,6 +142,10 @@ vendor_name null rakho, "chat" mat samjhna, ye bhi stock_query hai.
 - "undo": user keh raha hai ki abhi jo pichli entry hui (sale ya restock) wo galat thi, use wapas \
 karo. Jaise "galti ho gayi", "undo karo", "pichla wapas le lo", "cancel karo pichla wala". \
 items/vendor_name ki zarurat nahi.
+- "rename": kisi item ka naam galat likha/bola gaya tha, use theek karna hai (typo, galat OCR, \
+galat suna gaya). Jaise "Maggie ka naam Maggi kar do", "iska sahi naam XYZ hai", "naam galat hai, \
+ise ABC bolo". old_name mein purana (galat) naam, new_name mein sahi naam bharo. vendor_name bharo \
+agar isi message ya pichle context se pata chale, warna null.
 - "chat": baaki sab (greeting, casual baat, sawaal jiska jawab tumhare data mein nahi hai). \
 "reply" mein chhota (1-2 line) dostana Hinglish jawab do jaise ek dost deta hai. KABHI BHI koi \
 vendor ka naam, item ka naam, ya stock number khud se mat banao — tumhe pata nahi ki user ke \
@@ -164,8 +169,14 @@ def looks_like_question(text):
     return any(w in QUESTION_WORDS for w in words)
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def time_greeting():
-    hour = datetime.now().hour
+    """Railway's server clock runs in UTC, not IST — greeting by datetime.now()
+    alone was ~5.5 hours off from what a shopkeeper in India was actually seeing
+    (e.g. always "Good afternoon" well into their evening/night)."""
+    hour = datetime.now(IST).hour
     if hour < 12:
         return "Good morning"
     if hour < 17:
@@ -346,6 +357,31 @@ def _same_vendor(a, b):
     return bool(a) and bool(b) and a.strip().lower() == b.strip().lower()
 
 
+def _format_grouped(entries):
+    """entries: list of (vendor_or_None, item_line). A multi-item reply used to
+    repeat "(Karan)" after every single line; this groups items under one
+    "<b>Karan:</b>" header instead, printed once. Entries with vendor=None
+    (item not found / ambiguous-vendor prompts) get no header, in their
+    original position. Returns None if entries is empty."""
+    if not entries:
+        return None
+    groups = []
+    index_by_vendor = {}
+    for vendor, line in entries:
+        if vendor not in index_by_vendor:
+            index_by_vendor[vendor] = len(groups)
+            groups.append((vendor, []))
+        groups[index_by_vendor[vendor]][1].append(line)
+
+    out = []
+    for vendor, item_lines in groups:
+        if vendor:
+            out.append(f"<b>{html.escape(vendor)}:</b>")
+        out.extend(item_lines)
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 REASON_LABELS = {"sale": "sale", "delivery": "stock add", "undo": "undo"}
 
 
@@ -359,11 +395,37 @@ def handle_undo(ukey):
 
     reasons = {reason for *_, reason in results}
     label = REASON_LABELS.get(next(iter(reasons)), "entry") if len(reasons) == 1 else "entry"
-    lines = [f"Theek hai, pichla {label} wapas le liya:", ""]
+    entries = []
     for vendor, item, unit, new_qty, _reason in results:
         active_vendor[ukey] = vendor
-        lines.append(f"• <b>{html.escape(item)}</b>: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
-    send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        entries.append((vendor, f"• <b>{html.escape(item)}</b>: ab {fmt_qty(new_qty, unit)}"))
+    body = _format_grouped(entries)
+    send_message(chat_id, f"Theek hai, pichla {label} wapas le liya:\n\n{body}", parse_mode="HTML")
+
+
+def handle_rename(ukey, old_name, new_name, vendor_name):
+    chat_id, owner_id = ukey
+    vendor_name = vendor_name or active_vendor.get(ukey)
+    if not vendor_name:
+        send_message(chat_id, "Kaunse vendor ke stock mein naam badalna hai?")
+        return
+    if not old_name or not new_name:
+        send_message(chat_id, 'Samajh nahi aaya kaunsa naam badalna hai. Jaise likho: "Maggie ka naam Maggi kar do"')
+        return
+
+    conn = db.get_connection()
+    result = db.rename_item(conn, owner_id, vendor_name, old_name, new_name)
+    if result is None:
+        send_message(chat_id, f"{html.escape(vendor_name)} ke paas {html.escape(old_name)} mila nahi.")
+        return
+    vendor, old_canonical, final_name, unit, qty = result
+    active_vendor[ukey] = vendor
+    send_message(
+        chat_id,
+        f"Theek hai, <b>{html.escape(old_canonical)}</b> ka naam ab <b>{html.escape(final_name)}</b> hai — "
+        f"{fmt_qty(qty, unit)} ({html.escape(vendor)})",
+        parse_mode="HTML",
+    )
 
 
 def handle_stock_query(ukey, vendor_name):
@@ -385,8 +447,8 @@ def handle_stock_query(ukey, vendor_name):
 LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
 
 
-def _sale_line(matched_item, new_qty, matched_unit, vendor, qty_sold):
-    line = f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha ({html.escape(vendor)})"
+def _sale_line(matched_item, new_qty, matched_unit, qty_sold):
+    line = f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} bacha"
     qty_before = new_qty + qty_sold
     if new_qty < 0:
         line += "\n   ⚠️ Itna stock tha hi nahi, phir bhi kaat diya — ek baar check kar lena."
@@ -405,7 +467,7 @@ def handle_sale(ukey, items, vendor_name):
 
     conn = db.get_connection()
     batch_id = db.new_batch_id()  # all items from this one message undo together
-    lines = []
+    entries = []  # (vendor_or_None, line) — grouped under one vendor header at send time
     for item in items:
         name, qty, unit = item.get("name"), item.get("qty"), item.get("unit")
         if not name or not qty:
@@ -414,11 +476,11 @@ def handle_sale(ukey, items, vendor_name):
         if vendor_name:
             result = db.record_sale(conn, owner_id, vendor_name, name, qty, unit, batch_id)
             if result is None:
-                lines.append(f"• {html.escape(name)}: {html.escape(vendor_name)} ke paas ye stock mein nahi mila.")
+                entries.append((None, f"• {html.escape(name)}: {html.escape(vendor_name)} ke paas ye stock mein nahi mila."))
             else:
                 vendor, matched_item, matched_unit, new_qty = result
                 active_vendor[ukey] = vendor
-                lines.append(_sale_line(matched_item, new_qty, matched_unit, vendor, qty))
+                entries.append((vendor, _sale_line(matched_item, new_qty, matched_unit, qty)))
             continue
 
         matches = db.find_item_across_vendors(conn, owner_id, name)
@@ -426,21 +488,22 @@ def handle_sale(ukey, items, vendor_name):
         active_match = next((m for m in matches if _same_vendor(m["vendor_name"], current)), None)
 
         if not matches:
-            lines.append(f"• {html.escape(name)}: ye stock mein nahi mila.")
+            entries.append((None, f"• {html.escape(name)}: ye stock mein nahi mila."))
         elif len(matches) == 1 or active_match:
             m = active_match or matches[0]
             vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, m["vendor_name"], m["item_name"], qty, unit, batch_id)
             active_vendor[ukey] = vendor
-            lines.append(_sale_line(matched_item, new_qty, matched_unit, vendor, qty))
+            entries.append((vendor, _sale_line(matched_item, new_qty, matched_unit, qty)))
         else:
             vendors = " / ".join(html.escape(m["vendor_name"]) for m in matches)
             example = matches[0]["vendor_name"]
-            lines.append(
+            entries.append((None,
                 f"• {html.escape(name)}: {vendors} — dono ke paas hai, kis ka becha? "
                 f"Jaise likho: \"{example} ka {html.escape(name)} becha\""
-            )
+            ))
 
-    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML")
+    body = _format_grouped(entries)
+    send_message(chat_id, body or "Kuch update nahi hua.", parse_mode="HTML")
 
 
 def handle_restock(ukey, items, vendor_name):
@@ -460,6 +523,7 @@ def handle_restock(ukey, items, vendor_name):
     batch_id = db.new_batch_id()  # all items from this one message undo together
     lines = []
     missing_qty = []
+    resolved_vendor = None
     for item in items:
         name, qty, unit = item.get("name"), item.get("qty"), item.get("unit")
         if not name:
@@ -469,13 +533,17 @@ def handle_restock(ukey, items, vendor_name):
             continue
         vendor, matched_item, matched_unit, new_qty = db.add_stock(conn, owner_id, vendor_name, name, qty, unit, batch_id)
         active_vendor[ukey] = vendor
-        lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)} ({html.escape(vendor)})")
+        resolved_vendor = vendor
+        lines.append(f"• {html.escape(matched_item)}: ab {fmt_qty(new_qty, matched_unit)}")
 
+    parts = []
+    if lines:
+        parts.append(f"<b>{html.escape(resolved_vendor)}:</b>\n" + "\n".join(lines))
     if missing_qty:
         names = ", ".join(html.escape(n) for n in missing_qty)
-        lines.append(f"⚠️ {names} — kitna aaya nahi bataya, quantity ke saath phir se batao.")
+        parts.append(f"⚠️ {names} — kitna aaya nahi bataya, quantity ke saath phir se batao.")
 
-    send_message(chat_id, "\n".join(lines) if lines else "Kuch update nahi hua.", parse_mode="HTML")
+    send_message(chat_id, "\n\n".join(parts) if parts else "Kuch update nahi hua.", parse_mode="HTML")
 
 
 def extract_stock_items(text):
@@ -601,12 +669,15 @@ def confirm_stock_addition(ukey):
     data = pending_stock_confirmation.pop(ukey)
     conn = db.get_connection()
     batch_id = db.new_batch_id()  # all items from this one confirmation undo together
-    lines = ["<b>Stock update ho gaya:</b>", ""]
+    lines = []
+    resolved_vendor = None
     for item in data["items"]:
         vendor, name, unit, new_qty = db.add_stock(conn, owner_id, data["vendor_name"], item["name"], item["qty"], item.get("unit"), batch_id)
         active_vendor[ukey] = vendor
-        lines.append(f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)} ({html.escape(vendor)})")
-    send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        resolved_vendor = vendor
+        lines.append(f"• {html.escape(name)}: ab {fmt_qty(new_qty, unit)}")
+    header = f"<b>{html.escape(resolved_vendor)} — stock update ho gaya:</b>"
+    send_message(chat_id, header + "\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
 def handle_callback_query(cq):
@@ -804,6 +875,8 @@ def dispatch_intent(ukey, result):
         handle_restock(ukey, result.get("items", []), result.get("vendor_name"))
     elif intent == "undo":
         handle_undo(ukey)
+    elif intent == "rename":
+        handle_rename(ukey, result.get("old_name"), result.get("new_name"), result.get("vendor_name"))
     else:
         reply = result.get("reply")
         send_message(chat_id, reply or WELCOME, reply_markup=None if reply else MAIN_MENU)

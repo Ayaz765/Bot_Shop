@@ -252,6 +252,27 @@ def _find_vendor_in_stock(conn, owner_id, vendor_name):
     return _fuzzy_match(vendor_name, known)
 
 
+def _find_vendor_exact(conn, owner_id, vendor_name):
+    """Case/whitespace-insensitive EXACT match only — no substring or typo
+    fuzziness. Used by add_stock when deciding whether new stock belongs to an
+    existing vendor or a brand-new one: _find_vendor_in_stock's substring rule
+    (needed so "Ramesh" resolves to "Ramesh Traders" when selling/querying) also
+    silently folded a genuinely new "Karan Traders" into an existing "Karan" —
+    two different vendors merged into one with no way to tell they'd split.
+    Wrongly creating a near-duplicate vendor (visible, fixable via rename) is a
+    smaller problem than wrongly merging two real ones (invisible, not)."""
+    known = [
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT vendor_name FROM stock WHERE owner_id = ?", (owner_id,)
+        ).fetchall()
+    ]
+    target = _normalize(vendor_name)
+    for name in known:
+        if _normalize(name) == target:
+            return name
+    return None
+
+
 def _find_item_for_vendor(conn, owner_id, vendor_name, item_name):
     """Fuzzy-match an item name against one vendor's existing stock rows. None if no match."""
     known = [
@@ -275,7 +296,7 @@ def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id=N
     batch_id (optional): tag applied to the stock_movements row so multiple items
     from one message ("Maggi, Egg aaya") can be undone together as a unit.
     """
-    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name) or vendor_name
+    vendor = _find_vendor_exact(conn, owner_id, vendor_name) or vendor_name
     item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
 
     if item:
@@ -307,6 +328,60 @@ def add_stock(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id=N
         "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?", (owner_id, vendor, item)
     ).fetchone()
     return vendor, item, row[0], row[1]
+
+
+def rename_item(conn, owner_id, vendor_name, old_name, new_name):
+    """Corrects a misspelled/mis-transcribed item name for one vendor ("Maggie"
+    typed by mistake for "Maggi"). If new_name fuzzy-matches an item that
+    already exists under that vendor, the two are merged (quantities added,
+    old row dropped) instead of creating a duplicate — same fuzzy-identity rule
+    the rest of stock uses. Past stock_movements rows are relabeled too, so a
+    later "undo" still finds the item under its current name.
+
+    Returns (vendor_name, old_canonical_name, new_canonical_name, unit, qty),
+    or None if old_name doesn't match anything on record for this vendor."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+    if not vendor:
+        return None
+    old_item = _find_item_for_vendor(conn, owner_id, vendor, old_name)
+    if old_item is None:
+        return None
+
+    existing = conn.execute(
+        "SELECT qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (owner_id, vendor, old_item),
+    ).fetchone()
+    old_qty = existing[0]
+
+    target_item = _find_item_for_vendor(conn, owner_id, vendor, new_name)
+    if target_item and target_item != old_item:
+        conn.execute(
+            "UPDATE stock SET qty = qty + ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+            (old_qty, owner_id, vendor, target_item),
+        )
+        conn.execute(
+            "DELETE FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+            (owner_id, vendor, old_item),
+        )
+        final_name = target_item
+    else:
+        conn.execute(
+            "UPDATE stock SET item_name = ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+            (new_name, owner_id, vendor, old_item),
+        )
+        final_name = new_name
+
+    conn.execute(
+        "UPDATE stock_movements SET item_name = ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (final_name, owner_id, vendor, old_item),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (owner_id, vendor, final_name),
+    ).fetchone()
+    return vendor, old_item, final_name, row[0], row[1]
 
 
 def find_item_across_vendors(conn, owner_id, item_name):
