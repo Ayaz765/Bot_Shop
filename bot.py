@@ -1522,16 +1522,17 @@ EDIT_PAGE_HTML = """<!doctype html>
     cursor: pointer;
   }
   .error { color: #e04b4b; font-size: 13px; margin-top: 12px; display: none; }
-  #fallback-save {
+  #save-btn {
     display: block;
     width: 100%;
-    padding: 12px;
+    padding: 14px;
     margin-top: 16px;
     border: none;
     border-radius: 8px;
     background: var(--button);
     color: var(--button-text);
-    font-size: 15px;
+    font-size: 16px;
+    font-weight: 600;
     cursor: pointer;
   }
 </style>
@@ -1542,8 +1543,10 @@ EDIT_PAGE_HTML = """<!doctype html>
   <div id="rows"></div>
   <button id="add-row" type="button">+ Item jodo</button>
   <div class="error" id="error-msg"></div>
+  <button id="save-btn" type="button">💾 Save karo</button>
 
 <script>
+try {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
 
@@ -1566,7 +1569,8 @@ EDIT_PAGE_HTML = """<!doctype html>
     var binary = atob(str);
     var bytes = new Uint8Array(binary.length);
     for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder('utf-8').decode(bytes);
+    if (window.TextDecoder) return new TextDecoder('utf-8').decode(bytes);
+    return decodeURIComponent(escape(binary)); // older WebViews without TextDecoder
   }
 
   var params = new URLSearchParams(window.location.search);
@@ -1633,25 +1637,26 @@ EDIT_PAGE_HTML = """<!doctype html>
       return;
     }
     errEl.style.display = 'none';
-    if (tg) {
+    if (tg && tg.sendData) {
       tg.sendData(JSON.stringify({ items: items }));
       tg.close();
     } else {
-      alert('Ye page sirf Telegram ke andar kaam karta hai.');
+      alert('Ye page sirf Telegram ke andar (WebApp button se) kaam karta hai — browser mein direct khol ke save nahi hoga.');
     }
   }
 
-  if (tg) {
+  // Always-visible in-page button (some Telegram clients' native MainButton
+  // bar at the bottom can be easy to miss) — MainButton is wired too, as a
+  // bonus shortcut, but saving never depends on the user noticing it.
+  document.getElementById('save-btn').onclick = trySave;
+  if (tg && tg.MainButton) {
     tg.MainButton.setText('Save karo');
     tg.MainButton.show();
     tg.MainButton.onClick(trySave);
-  } else {
-    var fallbackBtn = document.createElement('button');
-    fallbackBtn.id = 'fallback-save';
-    fallbackBtn.textContent = 'Save karo';
-    fallbackBtn.onclick = trySave;
-    document.body.appendChild(fallbackBtn);
   }
+} catch (e) {
+  alert('Page load karne mein dikkat aayi: ' + (e && e.message ? e.message : e));
+}
 </script>
 </body>
 </html>
