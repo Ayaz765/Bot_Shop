@@ -18,6 +18,7 @@ flow). chat_id is still what messages get sent to; sender_id is who's mid-flow.
 import base64
 import html
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,8 @@ awaiting_stock_photo = {}  # (chat_id, sender_id) -> vendor_name, waiting for th
 awaiting_stock_manual_text = {}  # (chat_id, sender_id) -> vendor_name, waiting for typed item list
 pending_stock_confirmation = {}  # (chat_id, sender_id) -> {"vendor_name", "items"}, waiting yes/no
 awaiting_photo_purpose = {}  # (chat_id, sender_id) -> (vendor_name, file_path), waiting "stock ya summary?"
+pending_delete_confirmation = {}  # (chat_id, sender_id) -> {"target": "item"|"vendor", "vendor_name", "item_name"}, waiting yes/no
+awaiting_item_edit = {}  # (chat_id, sender_id) -> index into pending_stock_confirmation[ukey]["items"], waiting for corrected qty/name
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
@@ -77,11 +80,24 @@ STOCK_METHOD_MENU = {"inline_keyboard": [
     [{"text": BTN_STOCK_MANUAL, "callback_data": "stock_manual"}],
 ]}
 
-BTN_YES = "✅ Haan, add karo"
+BTN_YES = "✅ Sab sahi hai"
 BTN_NO = "❌ Nahi, cancel"
-CONFIRM_MENU = {"inline_keyboard": [
-    [{"text": BTN_YES, "callback_data": "confirm_yes"}],
-    [{"text": BTN_NO, "callback_data": "confirm_no"}],
+
+
+def build_confirmation_menu(items):
+    """One '✏️ <item>' button per item (tap to fix just that item's qty/name) plus
+    the usual confirm/cancel row — so fixing one wrong line doesn't mean retyping
+    the whole delivery list."""
+    keyboard = [[{"text": f"✏️ {item['name']}", "callback_data": f"edit_item:{i}"}] for i, item in enumerate(items)]
+    keyboard.append([{"text": BTN_YES, "callback_data": "confirm_yes"}])
+    keyboard.append([{"text": BTN_NO, "callback_data": "confirm_no"}])
+    return {"inline_keyboard": keyboard}
+
+BTN_DELETE_YES = "🗑️ Haan, hata do"
+BTN_DELETE_NO = "❌ Nahi, rehne do"
+DELETE_CONFIRM_MENU = {"inline_keyboard": [
+    [{"text": BTN_DELETE_YES, "callback_data": "delete_confirm_yes"}],
+    [{"text": BTN_DELETE_NO, "callback_data": "delete_confirm_no"}],
 ]}
 
 BTN_PHOTO_FOR_STOCK = "📦 Stock mein add karo"
@@ -98,10 +114,10 @@ NO_KEYBOARD = None
 
 ALL_BUTTON_TEXTS = {
     BTN_SUMMARIZE, BTN_STOCK, BTN_STOCK_PHOTO, BTN_STOCK_MANUAL, BTN_YES, BTN_NO,
-    BTN_PHOTO_FOR_STOCK, BTN_PHOTO_FOR_SUMMARY,
+    BTN_PHOTO_FOR_STOCK, BTN_PHOTO_FOR_SUMMARY, BTN_DELETE_YES, BTN_DELETE_NO,
 }
 
-YES_WORDS = {"haan", "ha", "han", "yes", "y", "ok", "okay", "theek hai", "kar do", "add karo"}
+YES_WORDS = {"haan", "ha", "han", "yes", "y", "ok", "okay", "theek hai", "kar do", "add karo", "sab sahi hai"}
 NO_WORDS = {"nahi", "nah", "no", "n", "cancel", "mat karo", "chhodo"}
 
 
@@ -114,7 +130,9 @@ def clear_stock_flow(ukey):
     awaiting_stock_photo.pop(ukey, None)
     awaiting_stock_manual_text.pop(ukey, None)
     pending_stock_confirmation.pop(ukey, None)
+    awaiting_item_edit.pop(ukey, None)
     awaiting_photo_purpose.pop(ukey, None)
+    pending_delete_confirmation.pop(ukey, None)
 
 
 STOCK_ENTRY_SYSTEM_PROMPT = """Ek dukaandaar type karke bata raha hai ki vendor se kaunse items \
@@ -130,9 +148,10 @@ ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to peh
 Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
 baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "history" | "chat", "items": \
-[{"name": string, "qty": number or null, "unit": string or null, "all": boolean}], "vendor_name": \
-string or null, "old_name": string or null, "new_name": string or null, "reply": string}
+{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "history" | "delete" | "chat", \
+"items": [{"name": string, "qty": number or null, "unit": string or null, "all": boolean}], \
+"vendor_name": string or null, "old_name": string or null, "new_name": string or null, \
+"rename_target": "item" | "vendor" | null, "delete_target": "item" | "vendor" | null, "reply": string}
 
 Is conversation ke pichle 1-2 messages bhi tumhe upar mil sakte hain. Agar user "isko", "ye", \
 "wahi wala" jaisa kuch bole, pehle wahi context dekho ki pichle message mein kaunsa item/vendor \
@@ -159,10 +178,23 @@ items/vendor_name ki zarurat nahi.
 history dikhao", "kab kya aaya", "delivery record batao", "pichle hafte kya aaya"). Ye sirf naya \
 maal AANE (restock) ka record hai, sale ka nahi. vendor_name bharo agar specific vendor ho, warna \
 null (sab vendors ka record).
-- "rename": kisi item ka naam galat likha/bola gaya tha, use theek karna hai (typo, galat OCR, \
-galat suna gaya). Jaise "Maggie ka naam Maggi kar do", "iska sahi naam XYZ hai", "naam galat hai, \
-ise ABC bolo". old_name mein purana (galat) naam, new_name mein sahi naam bharo. vendor_name bharo \
-agar isi message ya pichle context se pata chale, warna null.
+- "rename": koi purana naam galat likha/bola/suna gaya tha (typo, galat OCR), use theek karna hai \
+— ya to kisi ITEM ka naam, ya kisi VENDOR ka naam. Jaise "Maggie ka naam Maggi kar do" (item), \
+"Ramesh ka naam Ramesh Traders kar do" (vendor). old_name mein purana (galat) naam, new_name mein \
+sahi naam bharo. rename_target mein "item" ya "vendor" bharo — sirf tab jab message ya pichle \
+context se saaf pata chale in dono mein se kya hai (jaise "vendor ka naam" bola, ya old_name kisi \
+vendor list mein pehle se zikar ho chuka hai, to "vendor"; kisi vendor ke andar ek product jaisa \
+lage to "item"). Agar clear na ho, rename_target null rakho — khud mat chuno. rename_target \
+"item" ho to vendor_name bharo agar isi message ya pichle context se pata chale (kis vendor ke \
+stock mein ye item hai), warna null; rename_target "vendor" ho to vendor_name ki zarurat nahi.
+- "delete": user kisi item ko vendor ke stock se, ya poore vendor ko hi, hamesha ke liye list se \
+hata dena chahta hai — "sale" se alag hai (sale sirf becha hua maal ghatati hai, item list mein \
+rehta hai; delete record hi mita deta hai). Jaise "Maggi ko list se hata do", "isko delete kar \
+do", "Ramesh vendor ko hata do", "ye vendor nikaal do". delete_target mein "item" ya "vendor" \
+bharo — sirf tab jab message ya pichle context se saaf pata chale in dono mein se kya hatana hai. \
+Agar sirf "hata do"/"delete karo" bola aur item ya vendor ka koi zikar nahi (na isi message mein, \
+na context mein), to delete_target null rakho — khud mat chuno. Jo naam bataya gaya wo item ho to \
+items[0].name mein, vendor ho to vendor_name mein bharo.
 - "chat": baaki sab (greeting, casual baat, sawaal jiska jawab tumhare data mein nahi hai). \
 "reply" mein chhota (1-2 line) dostana Hinglish jawab do jaise ek dost deta hai. KABHI BHI koi \
 vendor ka naam, item ka naam, ya stock number khud se mat banao — tumhe pata nahi ki user ke \
@@ -309,7 +341,7 @@ def format_stock_confirmation(vendor_name, items):
             line += f" — Rs{fmt_money(item['rate'])}"
         lines.append(line)
     lines.append("")
-    lines.append("Stock mein add kar doon?")
+    lines.append("Sab sahi hai to confirm karo, ya kisi item ka naam tap karke usse edit karo.")
     return "\n".join(lines)
 
 
@@ -388,12 +420,13 @@ def _pad(text, width):
     return text.ljust(width)
 
 
-def format_stock_report(vendor_name, items):
+def format_stock_report(conn, owner_id, vendor_name, items):
     if not items:
         return f"📦 {html.escape(vendor_name)} ka koi stock record nahi hai mere paas."
 
     name_width = min(max(len(item["item_name"]) for item in items), 18)
     rows = []
+    forecasts = []  # low items with a trustworthy days-left estimate, shown below the table
     low_count = 0
     for item in items:
         qty = item["qty"]
@@ -404,6 +437,9 @@ def format_stock_report(vendor_name, items):
         elif qty <= LOW_STOCK_THRESHOLD:
             marker = " 📉"
             low_count += 1
+            days_left = db.estimate_days_left(conn, owner_id, vendor_name, item["item_name"], qty)
+            if days_left is not None:
+                forecasts.append(f"• {html.escape(item['item_name'])}: {_format_days_left(days_left)} khatam ho sakta hai")
         row = f"{_pad(item['item_name'], name_width)}  {fmt_qty(qty, item.get('unit'))}{marker}"
         last_delivery = _format_ist_date(item.get("last_delivery"))
         if last_delivery:
@@ -415,7 +451,10 @@ def format_stock_report(vendor_name, items):
         summary += f" · {low_count} kam bacha hai"
 
     table = html.escape("\n".join(rows))
-    return f"📦 <b>{html.escape(vendor_name)} ka stock</b>\n\n<pre>{table}</pre>\n{summary}"
+    out = f"📦 <b>{html.escape(vendor_name)} ka stock</b>\n\n<pre>{table}</pre>\n{summary}"
+    if forecasts:
+        out += "\n\n🔮 <b>Andaza (bikri ki raftaar se):</b>\n" + "\n".join(forecasts)
+    return out
 
 
 def _same_vendor(a, b):
@@ -468,14 +507,28 @@ def handle_undo(ukey):
     send_message(chat_id, f"Theek hai, pichla {label} wapas le liya:\n\n{body}", parse_mode="HTML")
 
 
-def handle_rename(ukey, old_name, new_name, vendor_name):
+def handle_rename(ukey, rename_target, old_name, new_name, vendor_name):
+    """Dispatches to the item- or vendor-level rename, or asks which one when
+    the model couldn't tell (rename_target is None) — same "missing data over
+    invented data" reasoning as handle_delete."""
+    chat_id, owner_id = ukey
+    if not old_name or not new_name:
+        send_message(chat_id, 'Samajh nahi aaya kaunsa naam badalna hai. Jaise likho: "Maggie ka naam Maggi kar do"')
+        return
+    if rename_target not in ("item", "vendor"):
+        send_message(chat_id, "Item ka naam badalna hai ya poore vendor ka? Bata do.")
+        return
+    if rename_target == "vendor":
+        handle_rename_vendor(ukey, old_name, new_name)
+    else:
+        handle_rename_item(ukey, old_name, new_name, vendor_name)
+
+
+def handle_rename_item(ukey, old_name, new_name, vendor_name):
     chat_id, owner_id = ukey
     vendor_name = vendor_name or active_vendor.get(ukey)
     if not vendor_name:
         send_message(chat_id, "Kaunse vendor ke stock mein naam badalna hai?")
-        return
-    if not old_name or not new_name:
-        send_message(chat_id, 'Samajh nahi aaya kaunsa naam badalna hai. Jaise likho: "Maggie ka naam Maggi kar do"')
         return
 
     conn = db.get_connection()
@@ -493,6 +546,88 @@ def handle_rename(ukey, old_name, new_name, vendor_name):
     )
 
 
+def handle_rename_vendor(ukey, old_name, new_name):
+    chat_id, owner_id = ukey
+    conn = db.get_connection()
+    result = db.rename_vendor(conn, owner_id, old_name, new_name)
+    if result is None:
+        send_message(chat_id, f"{html.escape(old_name)} naam ka koi vendor mila nahi.")
+        return
+    old_canonical, final_name = result
+    active_vendor[ukey] = final_name
+    send_message(
+        chat_id,
+        f"Theek hai, <b>{html.escape(old_canonical)}</b> ka naam ab <b>{html.escape(final_name)}</b> hai.",
+        parse_mode="HTML",
+    )
+
+
+def handle_delete(ukey, delete_target, item_name, vendor_name):
+    """Item/vendor removal is permanent (unlike a sale, which only lowers qty and
+    keeps history) — so this only ever queues a pending_delete_confirmation and
+    waits for an explicit yes/no, never deletes on the first message. If the
+    model couldn't tell item from vendor (delete_target is None), ask instead
+    of guessing — same "missing data over invented data" reasoning as elsewhere."""
+    chat_id, owner_id = ukey
+    vendor_name = vendor_name or active_vendor.get(ukey)
+
+    if delete_target not in ("item", "vendor"):
+        send_message(chat_id, "Kya hatana hai — koi item ya poora vendor? Naam bhi batao.")
+        return
+
+    if delete_target == "vendor":
+        if not vendor_name:
+            send_message(chat_id, "Kaunsa vendor hatana hai? Naam batao.")
+            return
+        pending_delete_confirmation[ukey] = {"target": "vendor", "vendor_name": vendor_name}
+        send_message(
+            chat_id,
+            f"⚠️ Pakka <b>{html.escape(vendor_name)}</b> ko poora hata du? Iska saara stock record "
+            "bhi chala jayega, wapas nahi aayega.",
+            parse_mode="HTML",
+            reply_markup=DELETE_CONFIRM_MENU,
+        )
+        return
+
+    if not item_name:
+        send_message(chat_id, "Kaunsa item hatana hai? Naam batao.")
+        return
+    if not vendor_name:
+        send_message(chat_id, "Kaunse vendor ke stock se hatana hai? Naam batao.")
+        return
+    pending_delete_confirmation[ukey] = {"target": "item", "vendor_name": vendor_name, "item_name": item_name}
+    send_message(
+        chat_id,
+        f"⚠️ Pakka <b>{html.escape(item_name)}</b> ko <b>{html.escape(vendor_name)}</b> ke stock se hata du?",
+        parse_mode="HTML",
+        reply_markup=DELETE_CONFIRM_MENU,
+    )
+
+
+def confirm_delete(ukey):
+    chat_id, owner_id = ukey
+    data = pending_delete_confirmation.pop(ukey)
+    conn = db.get_connection()
+
+    if data["target"] == "vendor":
+        vendor = db.delete_vendor(conn, owner_id, data["vendor_name"])
+        if vendor is None:
+            send_message(chat_id, f"{html.escape(data['vendor_name'])} mila nahi, kuch hataya nahi.")
+            return
+        if active_vendor.get(ukey) == vendor:
+            active_vendor.pop(ukey, None)
+        send_message(chat_id, f"Theek hai, <b>{html.escape(vendor)}</b> aur uska poora stock hata diya.", parse_mode="HTML")
+        return
+
+    result = db.delete_item(conn, owner_id, data["vendor_name"], data["item_name"])
+    if result is None:
+        send_message(chat_id, f"{html.escape(data['item_name'])} {html.escape(data['vendor_name'])} ke paas mila nahi.")
+        return
+    vendor, item = result
+    active_vendor[ukey] = vendor
+    send_message(chat_id, f"Theek hai, <b>{html.escape(item)}</b> ko {html.escape(vendor)} ke stock se hata diya.", parse_mode="HTML")
+
+
 def handle_stock_query(ukey, vendor_name):
     chat_id, owner_id = ukey
     conn = db.get_connection()
@@ -506,7 +641,7 @@ def handle_stock_query(ukey, vendor_name):
         return
     active_vendor[ukey] = vendor_name
     items = db.get_stock_with_last_delivery(conn, owner_id, vendor_name)
-    send_message(chat_id, format_stock_report(vendor_name, items), parse_mode="HTML")
+    send_message(chat_id, format_stock_report(conn, owner_id, vendor_name, items), parse_mode="HTML")
 
 
 def handle_history(ukey, vendor_name):
@@ -541,7 +676,14 @@ def handle_history(ukey, vendor_name):
 LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
 
 
-def _sale_line(matched_item, new_qty, matched_unit, qty_sold):
+def _format_days_left(days_left):
+    """'~0 din' reads wrong when the rate says it's basically out already."""
+    if days_left < 1:
+        return "bahut jald"
+    return f"~{days_left:.0f} din mein"
+
+
+def _sale_line(conn, owner_id, vendor, matched_item, new_qty, matched_unit, qty_sold):
     line = f"• {html.escape(matched_item)}: {fmt_qty(new_qty, matched_unit)} bacha"
     qty_before = new_qty + qty_sold
     if new_qty < 0:
@@ -550,6 +692,9 @@ def _sale_line(matched_item, new_qty, matched_unit, qty_sold):
         # only fires the sale that crosses the line, not every sale after — otherwise
         # every subsequent sale of an already-low item would repeat the same nudge
         line += f"\n   📉 Kam bacha hai ({fmt_qty(new_qty, matched_unit)}), mangwa lena."
+        days_left = db.estimate_days_left(conn, owner_id, vendor, matched_item, new_qty)
+        if days_left is not None:
+            line += f" Is raftaar se {_format_days_left(days_left)} khatam ho sakta hai."
     return line
 
 
@@ -588,7 +733,7 @@ def handle_sale(ukey, items, vendor_name):
             else:
                 vendor, matched_item, matched_unit, new_qty = result
                 active_vendor[ukey] = vendor
-                entries.append((vendor, _sale_line(matched_item, new_qty, matched_unit, qty)))
+                entries.append((vendor, _sale_line(conn, owner_id, vendor, matched_item, new_qty, matched_unit, qty)))
             continue
 
         matches = db.find_item_across_vendors(conn, owner_id, name)
@@ -605,7 +750,7 @@ def handle_sale(ukey, items, vendor_name):
             else:
                 vendor, matched_item, matched_unit, new_qty = db.record_sale(conn, owner_id, m["vendor_name"], m["item_name"], actual_qty, unit, batch_id)
                 active_vendor[ukey] = vendor
-                entries.append((vendor, _sale_line(matched_item, new_qty, matched_unit, actual_qty)))
+                entries.append((vendor, _sale_line(conn, owner_id, vendor, matched_item, new_qty, matched_unit, actual_qty)))
         else:
             vendors = " / ".join(html.escape(m["vendor_name"]) for m in matches)
             example = matches[0]["vendor_name"]
@@ -631,7 +776,13 @@ def handle_restock(ukey, items, vendor_name):
     silently decremented stock instead of adding it."""
     chat_id, owner_id = ukey
     if not items:
-        send_message(chat_id, "Samajh nahi aaya kya aaya. Phir se batao?")
+        send_message(
+            chat_id,
+            "📦 <b>Kya aaya, samajh nahi paaya</b>\n\n"
+            "Item ka naam aur quantity dono batao, jaise:\n"
+            "<code>Biscuit 20 pcs, Soap 10 pcs</code>",
+            parse_mode="HTML",
+        )
         return
     vendor_name = vendor_name or active_vendor.get(ukey)
     if not vendor_name:
@@ -751,7 +902,7 @@ def process_stock_photo(ukey, vendor_name, file_path):
             send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein. Dusri photo try karo.")
             return False
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items}
-        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
         return True
     except Exception:
         import traceback
@@ -774,7 +925,7 @@ def process_stock_manual(ukey, vendor_name, text):
             send_message(chat_id, "Koi item/quantity samajh nahi aayi. Phir se batao, jaise: \"Biscuit 20 pcs\"")
             return False
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items}
-        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=CONFIRM_MENU)
+        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
         return True
     except Exception:
         import traceback
@@ -800,6 +951,63 @@ def confirm_stock_addition(ukey):
         lines.append(line)
     header = f"<b>{html.escape(resolved_vendor)} — stock update ho gaya:</b>"
     send_message(chat_id, header + "\n\n" + "\n".join(lines), parse_mode="HTML")
+
+
+ITEM_EDIT_PATTERN = re.compile(r"^(?P<name>.*?)\s*(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]+)?\s*$")
+
+
+def _parse_item_edit_reply(text, current_name):
+    """Parses a per-item correction: 'qty', 'qty unit', or 'new name qty unit' —
+    a name is optional (keeps current_name if left out), a qty is not. Local
+    regex instead of another Gemini call: this is a single short reply about one
+    already-known item, not free-form extraction, so a deterministic parse is
+    both faster and more predictable than an API round trip."""
+    match = ITEM_EDIT_PATTERN.match(text.strip())
+    if not match or not match.group("qty"):
+        return None
+    name = match.group("name").strip() or current_name
+    return {"name": name, "qty": float(match.group("qty")), "unit": match.group("unit")}
+
+
+def handle_item_edit_tap(ukey, index):
+    """User tapped '✏️ <item>' on a pending stock confirmation — ask just for
+    that one item's corrected qty/name instead of making them retype everything."""
+    chat_id = ukey[0]
+    data = pending_stock_confirmation.get(ukey)
+    if not data or index >= len(data["items"]):
+        return
+    awaiting_item_edit[ukey] = index
+    item = data["items"][index]
+    send_message(
+        chat_id,
+        f"<b>{html.escape(item['name'])}</b> ki sahi qty/naam batao, jaise:\n"
+        '"8 pcs" (sirf qty badalni hai) ya "Soap 8 pcs" (naam bhi badalna hai)',
+        parse_mode="HTML",
+    )
+
+
+def apply_item_edit(ukey, text):
+    """Reply to handle_item_edit_tap's prompt — updates one item in place and
+    re-shows the confirmation (with fresh edit buttons) so more items can be
+    fixed, or the delivery confirmed, in the same pass."""
+    chat_id = ukey[0]
+    index = awaiting_item_edit.pop(ukey)
+    data = pending_stock_confirmation.get(ukey)
+    if not data or index >= len(data["items"]):
+        return
+    current = data["items"][index]
+    parsed = _parse_item_edit_reply(text, current["name"])
+    if parsed is None:
+        send_message(chat_id, 'Samajh nahi aaya. Qty ke saath batao, jaise: "8 pcs"')
+        awaiting_item_edit[ukey] = index
+        return
+    data["items"][index] = parsed
+    send_message(
+        chat_id,
+        format_stock_confirmation(data["vendor_name"], data["items"]),
+        parse_mode="HTML",
+        reply_markup=build_confirmation_menu(data["items"]),
+    )
 
 
 def handle_callback_query(cq):
@@ -836,9 +1044,19 @@ def handle_callback_query(cq):
     elif data == "confirm_yes" and ukey in pending_stock_confirmation:
         confirm_stock_addition(ukey)
 
+    elif data.startswith("edit_item:") and ukey in pending_stock_confirmation:
+        handle_item_edit_tap(ukey, int(data.split(":", 1)[1]))
+
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
         pending_stock_confirmation.pop(ukey, None)
         send_message(chat_id, "Theek hai, cancel kar diya.")
+
+    elif data == "delete_confirm_yes" and ukey in pending_delete_confirmation:
+        confirm_delete(ukey)
+
+    elif data == "delete_confirm_no" and ukey in pending_delete_confirmation:
+        pending_delete_confirmation.pop(ukey, None)
+        send_message(chat_id, "Theek hai, rehne diya.")
 
     elif data == "photo_purpose_stock" and ukey in awaiting_photo_purpose:
         vendor_name, file_path = awaiting_photo_purpose.pop(ukey)
@@ -982,6 +1200,9 @@ def handle_update(update):
         if process_stock_manual(ukey, vendor_name, text):
             awaiting_stock_manual_text.pop(ukey, None)
 
+    elif ukey in awaiting_item_edit:
+        apply_item_edit(ukey, text)
+
     elif ukey in pending_stock_confirmation and (text == BTN_YES or text.lower() in YES_WORDS):
         confirm_stock_addition(ukey)
 
@@ -990,7 +1211,22 @@ def handle_update(update):
         send_message(chat_id, "Theek hai, cancel kar diya.")
 
     elif ukey in pending_stock_confirmation:
-        send_message(chat_id, "Haan ya nahi bata do — stock mein add karna hai?", reply_markup=CONFIRM_MENU)
+        items = pending_stock_confirmation[ukey]["items"]
+        send_message(
+            chat_id,
+            "Sab sahi hai to confirm karo, ya kisi item ko edit karo.",
+            reply_markup=build_confirmation_menu(items),
+        )
+
+    elif ukey in pending_delete_confirmation and (text == BTN_DELETE_YES or text.lower() in YES_WORDS):
+        confirm_delete(ukey)
+
+    elif ukey in pending_delete_confirmation and (text == BTN_DELETE_NO or text.lower() in NO_WORDS):
+        pending_delete_confirmation.pop(ukey)
+        send_message(chat_id, "Theek hai, rehne diya.")
+
+    elif ukey in pending_delete_confirmation:
+        send_message(chat_id, "Haan ya nahi bata do — hatana hai?", reply_markup=DELETE_CONFIRM_MENU)
 
     elif ukey in awaiting_photo_purpose and (text == BTN_PHOTO_FOR_STOCK or "stock" in text.lower()):
         vendor_name, file_path = awaiting_photo_purpose.pop(ukey)
@@ -1029,12 +1265,67 @@ def dispatch_intent(ukey, result):
     elif intent == "undo":
         handle_undo(ukey)
     elif intent == "rename":
-        handle_rename(ukey, result.get("old_name"), result.get("new_name"), result.get("vendor_name"))
+        handle_rename(ukey, result.get("rename_target"), result.get("old_name"), result.get("new_name"), result.get("vendor_name"))
     elif intent == "history":
         handle_history(ukey, result.get("vendor_name"))
+    elif intent == "delete":
+        items = result.get("items") or []
+        item_name = items[0].get("name") if items else None
+        handle_delete(ukey, result.get("delete_target"), item_name, result.get("vendor_name"))
     else:
         reply = result.get("reply")
         send_message(chat_id, reply or WELCOME, reply_markup=None if reply else MAIN_MENU)
+
+
+DIGEST_HOUR_IST = 9  # don't message before a shopkeeper's likely awake and at the shop
+
+
+def _chat_id_for_owner(owner_id):
+    """A proactive digest needs a chat_id to send to, but stock is scoped by
+    owner_id (== sender_id) — find the chat this person last talked to the bot
+    in, from whoever's already onboarded. None if they've never messaged us
+    (shouldn't happen for an owner_id with stock rows, but not worth a crash)."""
+    for chat_id, sender_id in user_names:
+        if sender_id == owner_id:
+            return chat_id
+    return None
+
+
+def format_daily_digest(conn, owner_id, low_items):
+    lines = ["🌅 <b>Aaj ka stock alert</b>", ""]
+    for item in low_items:
+        marker = "⚠️" if item["qty"] < 0 else "📉"
+        line = f"{marker} {html.escape(item['item_name'])} ({html.escape(item['vendor_name'])}): {fmt_qty(item['qty'], item.get('unit'))}"
+        days_left = db.estimate_days_left(conn, owner_id, item["vendor_name"], item["item_name"], item["qty"])
+        if days_left is not None:
+            line += f" — {_format_days_left(days_left)} khatam ho sakta hai"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def maybe_send_daily_digests():
+    """Called once per poll-loop tick (main()). Sends at most one digest per
+    owner per IST calendar day, and only once that day's check has passed
+    DIGEST_HOUR_IST — this is on top of, not instead of, the reactive low-stock
+    nudge _sale_line already gives at sale time; this is the safety net for
+    whatever that missed (never sold in a way that crossed the threshold, or
+    the shopkeeper hasn't messaged the bot in a few days)."""
+    now = datetime.now(IST)
+    if now.hour < DIGEST_HOUR_IST:
+        return
+    today = now.strftime("%Y-%m-%d")
+    conn = db.get_connection()
+    for owner_id in db.get_owners_with_stock(conn):
+        if db.get_last_digest_date(conn, owner_id) == today:
+            continue
+        db.set_last_digest_date(conn, owner_id, today)  # mark checked regardless, so a quiet day isn't re-scanned all day
+        low_items = db.get_low_stock_items(conn, owner_id, LOW_STOCK_THRESHOLD)
+        if not low_items:
+            continue
+        chat_id = _chat_id_for_owner(owner_id)
+        if chat_id is None:
+            continue
+        send_message(chat_id, format_daily_digest(conn, owner_id, low_items), parse_mode="HTML")
 
 
 def main():
@@ -1054,6 +1345,11 @@ def main():
                     handle_callback_query(update["callback_query"])
                 else:
                     handle_update(update)
+            try:
+                maybe_send_daily_digests()
+            except Exception:
+                import traceback
+                traceback.print_exc()
         except requests.exceptions.RequestException as e:
             print(f"Network hiccup, retrying in 5s: {e}", flush=True)
             time.sleep(5)

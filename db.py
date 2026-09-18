@@ -4,6 +4,7 @@ import difflib
 import os
 import sqlite3
 import uuid
+from datetime import datetime
 
 # Overridable so a host with an ephemeral filesystem (e.g. Railway) can point this
 # at a mounted persistent volume instead of losing the db on every redeploy.
@@ -83,6 +84,12 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS users (
             owner_id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS digest_log (
+            owner_id INTEGER PRIMARY KEY,
+            last_sent_date TEXT NOT NULL
         )
     """)
     # Migration for dbs created before batch_id existed — CREATE TABLE IF NOT
@@ -384,6 +391,92 @@ def rename_item(conn, owner_id, vendor_name, old_name, new_name):
     return vendor, old_item, final_name, row[0], row[1]
 
 
+def rename_vendor(conn, owner_id, old_name, new_name):
+    """Corrects a misspelled/mis-transcribed vendor name across all of that
+    vendor's stock (every item, and its stock_movements history) — the vendor-
+    level counterpart to rename_item. If new_name matches a vendor that already
+    exists, each of the old vendor's items merges into it (quantities added
+    onto a matching item there, moved over as a new item otherwise) instead of
+    leaving the same vendor split under two names.
+
+    Returns (old_canonical_name, new_canonical_name), or None if old_name
+    doesn't match any vendor on record for this owner."""
+    vendor = _find_vendor_in_stock(conn, owner_id, old_name)
+    if not vendor:
+        return None
+
+    target_vendor = _find_vendor_exact(conn, owner_id, new_name)
+    if target_vendor and target_vendor != vendor:
+        rows = conn.execute(
+            "SELECT item_name, qty FROM stock WHERE owner_id = ? AND vendor_name = ?", (owner_id, vendor)
+        ).fetchall()
+        for item_name, qty in rows:
+            existing_item = _find_item_for_vendor(conn, owner_id, target_vendor, item_name)
+            if existing_item:
+                conn.execute(
+                    "UPDATE stock SET qty = qty + ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+                    (qty, owner_id, target_vendor, existing_item),
+                )
+            else:
+                conn.execute(
+                    "UPDATE stock SET vendor_name = ? WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+                    (target_vendor, owner_id, vendor, item_name),
+                )
+        # whatever's left under the old name is the merged-away items (moved rows
+        # above already carry target_vendor, so this only catches those)
+        conn.execute("DELETE FROM stock WHERE owner_id = ? AND vendor_name = ?", (owner_id, vendor))
+        conn.execute(
+            "UPDATE stock_movements SET vendor_name = ? WHERE owner_id = ? AND vendor_name = ?",
+            (target_vendor, owner_id, vendor),
+        )
+        conn.commit()
+        return vendor, target_vendor
+
+    conn.execute(
+        "UPDATE stock SET vendor_name = ? WHERE owner_id = ? AND vendor_name = ?", (new_name, owner_id, vendor)
+    )
+    conn.execute(
+        "UPDATE stock_movements SET vendor_name = ? WHERE owner_id = ? AND vendor_name = ?",
+        (new_name, owner_id, vendor),
+    )
+    conn.commit()
+    return vendor, new_name
+
+
+def delete_item(conn, owner_id, vendor_name, item_name):
+    """Permanently drops one item from a vendor's stock list — unlike record_sale
+    (which only lowers qty and keeps the row/history), this removes the row
+    entirely. stock_movements rows are left as-is; they're history of what
+    happened, not current stock. Returns (vendor_name, item_name) as matched,
+    or None if either the vendor or the item doesn't exist on record."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+    if not vendor:
+        return None
+    item = _find_item_for_vendor(conn, owner_id, vendor, item_name)
+    if item is None:
+        return None
+    conn.execute(
+        "DELETE FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?",
+        (owner_id, vendor, item),
+    )
+    conn.commit()
+    return vendor, item
+
+
+def delete_vendor(conn, owner_id, vendor_name):
+    """Permanently drops a vendor and every item in its stock list. Returns the
+    canonical vendor_name as matched, or None if this owner has no such vendor."""
+    vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+    if not vendor:
+        return None
+    conn.execute(
+        "DELETE FROM stock WHERE owner_id = ? AND vendor_name = ?",
+        (owner_id, vendor),
+    )
+    conn.commit()
+    return vendor
+
+
 def find_item_across_vendors(conn, owner_id, item_name):
     """Fuzzy-matches item_name against this owner's vendors' stock. Used to resolve a
     sale when the vendor wasn't mentioned: 0 matches = unknown item, 1 = unambiguous,
@@ -438,6 +531,44 @@ def record_sale(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id
         "SELECT unit, qty FROM stock WHERE owner_id = ? AND vendor_name = ? AND item_name = ?", (owner_id, vendor, item)
     ).fetchone()
     return vendor, item, row[0], row[1]
+
+
+MIN_SALE_DATAPOINTS = 3  # fewer sale records than this and a daily-rate guess is just noise
+MIN_SALE_SPAN_DAYS = 2  # sales bunched within a day or so don't reveal an actual daily rate
+
+
+def estimate_days_left(conn, owner_id, vendor_name, item_name, current_qty):
+    """Rough days-until-stockout from this item's own sale history: total units
+    sold over the span between its first and last recorded sale gives an average
+    daily rate, and current_qty / that rate is the forecast.
+
+    Returns None — not a lowball guess — when there isn't enough sale history to
+    trust a rate (see MIN_SALE_DATAPOINTS/MIN_SALE_SPAN_DAYS), when nothing has
+    sold, or when current_qty is already 0 or negative (already out, not a
+    forecast question). A wrong forecast costs more shopkeeper trust than no
+    forecast at all — same reasoning as checker.py's false-alarm rule."""
+    if current_qty is None or current_qty <= 0:
+        return None
+    rows = conn.execute(
+        "SELECT change, created_at FROM stock_movements "
+        "WHERE owner_id = ? AND vendor_name = ? AND item_name = ? AND reason = 'sale' "
+        "ORDER BY created_at",
+        (owner_id, vendor_name, item_name),
+    ).fetchall()
+    if len(rows) < MIN_SALE_DATAPOINTS:
+        return None
+
+    total_sold = -sum(change for change, _created_at in rows)  # sale rows are stored negative
+    if total_sold <= 0:
+        return None
+    first = datetime.strptime(rows[0][1], "%Y-%m-%d %H:%M:%S")
+    last = datetime.strptime(rows[-1][1], "%Y-%m-%d %H:%M:%S")
+    span_days = (last - first).total_seconds() / 86400
+    if span_days < MIN_SALE_SPAN_DAYS:
+        return None
+
+    daily_rate = total_sold / span_days
+    return current_qty / daily_rate
 
 
 def undo_last_movement(conn, owner_id):
@@ -508,6 +639,38 @@ def get_item_qty(conn, owner_id, vendor_name, item_name):
         (owner_id, vendor, item),
     ).fetchone()
     return row[0] if row else None
+
+
+def get_owners_with_stock(conn):
+    """Distinct owner_ids that have at least one stock row — candidates for the
+    daily low-stock digest (nothing to check for someone with no stock yet)."""
+    rows = conn.execute("SELECT DISTINCT owner_id FROM stock").fetchall()
+    return [r[0] for r in rows]
+
+
+def get_low_stock_items(conn, owner_id, threshold):
+    """Every item across all of this owner's vendors at or below threshold
+    (out-of-stock/negative included), lowest qty first — feeds the daily digest
+    so it doesn't have to loop get_stock_for_vendor over every vendor itself."""
+    rows = conn.execute(
+        "SELECT vendor_name, item_name, unit, qty FROM stock WHERE owner_id = ? AND qty <= ? ORDER BY qty",
+        (owner_id, threshold),
+    ).fetchall()
+    return [{"vendor_name": r[0], "item_name": r[1], "unit": r[2], "qty": r[3]} for r in rows]
+
+
+def get_last_digest_date(conn, owner_id):
+    row = conn.execute("SELECT last_sent_date FROM digest_log WHERE owner_id = ?", (owner_id,)).fetchone()
+    return row[0] if row else None
+
+
+def set_last_digest_date(conn, owner_id, date_str):
+    conn.execute(
+        "INSERT INTO digest_log (owner_id, last_sent_date) VALUES (?, ?) "
+        "ON CONFLICT(owner_id) DO UPDATE SET last_sent_date = excluded.last_sent_date",
+        (owner_id, date_str),
+    )
+    conn.commit()
 
 
 def get_vendors(conn, owner_id):
