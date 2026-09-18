@@ -20,6 +20,7 @@ import html
 import http.server
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -89,6 +90,7 @@ awaiting_stock_manual_text = {}  # (chat_id, sender_id) -> vendor_name, waiting 
 pending_stock_confirmation = {}  # (chat_id, sender_id) -> {"vendor_name", "items"}, waiting yes/no
 awaiting_photo_purpose = {}  # (chat_id, sender_id) -> (vendor_name, file_path), waiting "stock ya summary?"
 pending_delete_confirmation = {}  # (chat_id, sender_id) -> {"target": "item"|"vendor", "vendor_name", "item_name"}, waiting yes/no
+awaiting_item_edit = {}  # (chat_id, sender_id) -> index into pending_stock_confirmation[ukey]["items"] — group-chat fallback only (see build_confirmation_menu)
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
@@ -109,20 +111,21 @@ BTN_NO = "❌ Nahi, cancel"
 
 
 def build_confirmation_menu(ukey, vendor_name, items):
-    """Confirm/cancel row, plus a WebApp edit button when we have a public URL
-    to open (see build_edit_webapp_url) — a real editable form instead of the
-    tap-then-type-in-chat flow, which felt clunky even kept to one message.
-
-    Telegram only allows web_app buttons in a private chat with the bot — a
-    group chat (negative chat_id) rejects the whole sendMessage/editMessageText
-    call with BUTTON_TYPE_INVALID if one is included, which previously got a
-    group stuck (every retry hit the same error). So the edit button is
-    skipped entirely there; group chats fall back to cancel-and-redo."""
+    """Confirm/cancel row, plus an edit affordance:
+    - Private chat: a WebApp edit button (see build_edit_webapp_url) — a real
+      editable form instead of tapping through chat.
+    - Group chat: Telegram rejects web_app buttons there outright
+      (BUTTON_TYPE_INVALID — got a group stuck retrying the same error before
+      this split existed), so groups get one '✏️ <item>' button per item
+      instead, each opening the old tap-then-type-in-chat flow."""
     chat_id = ukey[0]
     keyboard = []
-    edit_url = build_edit_webapp_url(vendor_name, items) if chat_id > 0 else None
-    if edit_url:
-        keyboard.append([{"text": "✏️ List edit karo", "web_app": {"url": edit_url}}])
+    if chat_id > 0:
+        edit_url = build_edit_webapp_url(vendor_name, items)
+        if edit_url:
+            keyboard.append([{"text": "✏️ List edit karo", "web_app": {"url": edit_url}}])
+    else:
+        keyboard.extend([{"text": f"✏️ {item['name']}", "callback_data": f"edit_item:{i}"}] for i, item in enumerate(items))
     keyboard.append([{"text": BTN_YES, "callback_data": "confirm_yes"}])
     keyboard.append([{"text": BTN_NO, "callback_data": "confirm_no"}])
     return {"inline_keyboard": keyboard}
@@ -164,6 +167,7 @@ def clear_stock_flow(ukey):
     awaiting_stock_photo.pop(ukey, None)
     awaiting_stock_manual_text.pop(ukey, None)
     pending_stock_confirmation.pop(ukey, None)
+    awaiting_item_edit.pop(ukey, None)
     awaiting_photo_purpose.pop(ukey, None)
     pending_delete_confirmation.pop(ukey, None)
 
@@ -1049,6 +1053,79 @@ def handle_webapp_edit(ukey, raw_data):
     )
 
 
+# Group-chat edit fallback — Telegram won't allow the WebApp button there (see
+# build_confirmation_menu), so this reproduces the same "edit stays in one
+# message" idea via tap-then-type-in-chat instead of a form.
+ITEM_EDIT_PATTERN = re.compile(r"^(?P<name>.*?)\s*(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]+)?\s*$")
+
+EDIT_CANCEL_MENU = {"inline_keyboard": [[{"text": "🔙 Wapas list pe jao", "callback_data": "cancel_item_edit"}]]}
+
+
+def _parse_item_edit_reply(text, current_name):
+    """Parses a per-item correction: 'qty', 'qty unit', or 'new name qty unit' —
+    a name is optional (keeps current_name if left out), a qty is not. Local
+    regex instead of another Gemini call: this is a single short reply about one
+    already-known item, not free-form extraction, so a deterministic parse is
+    both faster and more predictable than an API round trip."""
+    match = ITEM_EDIT_PATTERN.match(text.strip())
+    if not match or not match.group("qty"):
+        return None
+    name = match.group("name").strip() or current_name
+    return {"name": name, "qty": float(match.group("qty")), "unit": match.group("unit")}
+
+
+def handle_item_edit_tap(ukey, index):
+    """User tapped '✏️ <item>' on a pending stock confirmation (group chat) —
+    edits that same message to ask just for this one item's corrected
+    qty/name, instead of making them retype everything."""
+    data = pending_stock_confirmation.get(ukey)
+    if not data or index >= len(data["items"]):
+        return
+    awaiting_item_edit[ukey] = index
+    item = data["items"][index]
+    text = (
+        f"<b>{html.escape(item['name'])}</b> ki sahi qty/naam batao, jaise:\n"
+        '"8 pcs" (sirf qty badalni hai) ya "Soap 8 pcs" (naam bhi badalna hai)'
+    )
+    _show_in_confirmation_message(ukey, data, text, EDIT_CANCEL_MENU)
+
+
+def cancel_item_edit(ukey):
+    """'Wapas list pe jao' tap — drops back to the confirmation list unchanged,
+    editing the same message rather than sending a new one."""
+    awaiting_item_edit.pop(ukey, None)
+    data = pending_stock_confirmation.get(ukey)
+    if not data:
+        return
+    _show_in_confirmation_message(
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(ukey, data["vendor_name"], data["items"])
+    )
+
+
+def apply_item_edit(ukey, text):
+    """Reply to handle_item_edit_tap's prompt — updates one item in place and
+    edits the same confirmation message back (with fresh edit buttons) so more
+    items can be fixed, or the delivery confirmed, without piling up messages."""
+    index = awaiting_item_edit.pop(ukey)
+    data = pending_stock_confirmation.get(ukey)
+    if not data or index >= len(data["items"]):
+        return
+    current = data["items"][index]
+    parsed = _parse_item_edit_reply(text, current["name"])
+    if parsed is None:
+        awaiting_item_edit[ukey] = index
+        retry_text = (
+            'Samajh nahi aaya. Qty ke saath batao, jaise: "8 pcs"\n\n'
+            f"<b>{html.escape(current['name'])}</b> ki sahi qty/naam batao:"
+        )
+        _show_in_confirmation_message(ukey, data, retry_text, EDIT_CANCEL_MENU)
+        return
+    data["items"][index] = parsed
+    _show_in_confirmation_message(
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(ukey, data["vendor_name"], data["items"])
+    )
+
+
 def handle_callback_query(cq):
     """Inline-button taps. Mirrors the equivalent text == BTN_X branches in
     handle_update, but keyed off callback_data instead of typed text."""
@@ -1083,8 +1160,15 @@ def handle_callback_query(cq):
     elif data == "confirm_yes" and ukey in pending_stock_confirmation:
         confirm_stock_addition(ukey)
 
+    elif data.startswith("edit_item:") and ukey in pending_stock_confirmation:
+        handle_item_edit_tap(ukey, int(data.split(":", 1)[1]))
+
+    elif data == "cancel_item_edit" and ukey in pending_stock_confirmation:
+        cancel_item_edit(ukey)
+
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
         cancelled = pending_stock_confirmation.pop(ukey, None)
+        awaiting_item_edit.pop(ukey, None)
         _show_in_confirmation_message(ukey, cancelled or {}, "Theek hai, cancel kar diya.", {"inline_keyboard": []})
 
     elif data == "delete_confirm_yes" and ukey in pending_delete_confirmation:
@@ -1245,6 +1329,9 @@ def handle_update(update):
         vendor_name = awaiting_stock_manual_text[ukey]
         if process_stock_manual(ukey, vendor_name, text):
             awaiting_stock_manual_text.pop(ukey, None)
+
+    elif ukey in awaiting_item_edit:
+        apply_item_edit(ukey, text)
 
     elif ukey in pending_stock_confirmation and (text == BTN_YES or text.lower() in YES_WORDS):
         confirm_stock_addition(ukey)
