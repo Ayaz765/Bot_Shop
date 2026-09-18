@@ -245,6 +245,8 @@ def _format_ist_date(utc_timestamp):
 
 
 def send_message(chat_id, text, parse_mode=None, reply_markup=None):
+    """Returns the sent message's message_id (so a caller can later edit that
+    exact message in place instead of sending a new one), or None on failure."""
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -254,8 +256,28 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
     resp = requests.post(f"{API_ROOT}/sendMessage", json=payload)
     if resp.status_code != 200:
         print(f"DEBUG send FAILED ({resp.status_code}) to {chat_id}: {resp.text[:300]} | tried to send: {preview}", flush=True)
-    else:
-        print(f"DEBUG sent to {chat_id}: {preview}", flush=True)
+        return None
+    print(f"DEBUG sent to {chat_id}: {preview}", flush=True)
+    return resp.json().get("result", {}).get("message_id")
+
+
+def edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
+    """Rewrites an already-sent message in place — used to keep the stock-add
+    confirmation (and its per-item edits) as one evolving message instead of a
+    new bubble at every step. reply_markup=None keeps the current keyboard;
+    pass {"inline_keyboard": []} to clear it."""
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    preview = text.replace("\n", " ")[:150]
+    resp = requests.post(f"{API_ROOT}/editMessageText", json=payload)
+    if resp.status_code != 200:
+        print(f"DEBUG edit FAILED ({resp.status_code}) to {chat_id}/{message_id}: {resp.text[:300]} | tried: {preview}", flush=True)
+        return False
+    print(f"DEBUG edited {chat_id}/{message_id}: {preview}", flush=True)
+    return True
 
 
 def answer_callback(callback_query_id):
@@ -901,8 +923,8 @@ def process_stock_photo(ukey, vendor_name, file_path):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein. Dusri photo try karo.")
             return False
-        pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items}
-        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
         import traceback
@@ -924,14 +946,26 @@ def process_stock_manual(ukey, vendor_name, text):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi. Phir se batao, jaise: \"Biscuit 20 pcs\"")
             return False
-        pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items}
-        send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
         import traceback
         traceback.print_exc()
         send_message(chat_id, "Samajh nahi paya. Phir se try karo.")
         return False
+
+
+def _show_in_confirmation_message(ukey, data, text, reply_markup):
+    """Edits the tracked confirmation message in place (so tapping through an
+    edit stays one evolving message instead of a new bubble each step);
+    falls back to a new message only if we never got that message's id
+    (e.g. the original send failed)."""
+    chat_id = ukey[0]
+    if data.get("message_id"):
+        edit_message(chat_id, data["message_id"], text, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
 
 
 def confirm_stock_addition(ukey):
@@ -950,10 +984,12 @@ def confirm_stock_addition(ukey):
             line += f" (Rs{fmt_money(item['rate'])}/each)"
         lines.append(line)
     header = f"<b>{html.escape(resolved_vendor)} — stock update ho gaya:</b>"
-    send_message(chat_id, header + "\n\n" + "\n".join(lines), parse_mode="HTML")
+    _show_in_confirmation_message(ukey, data, header + "\n\n" + "\n".join(lines), {"inline_keyboard": []})
 
 
 ITEM_EDIT_PATTERN = re.compile(r"^(?P<name>.*?)\s*(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]+)?\s*$")
+
+EDIT_CANCEL_MENU = {"inline_keyboard": [[{"text": "🔙 Wapas list pe jao", "callback_data": "cancel_item_edit"}]]}
 
 
 def _parse_item_edit_reply(text, current_name):
@@ -970,27 +1006,37 @@ def _parse_item_edit_reply(text, current_name):
 
 
 def handle_item_edit_tap(ukey, index):
-    """User tapped '✏️ <item>' on a pending stock confirmation — ask just for
-    that one item's corrected qty/name instead of making them retype everything."""
-    chat_id = ukey[0]
+    """User tapped '✏️ <item>' on a pending stock confirmation — edits that same
+    message to ask just for this one item's corrected qty/name, instead of
+    sending a new message (and instead of making them retype everything)."""
     data = pending_stock_confirmation.get(ukey)
     if not data or index >= len(data["items"]):
         return
     awaiting_item_edit[ukey] = index
     item = data["items"][index]
-    send_message(
-        chat_id,
+    text = (
         f"<b>{html.escape(item['name'])}</b> ki sahi qty/naam batao, jaise:\n"
-        '"8 pcs" (sirf qty badalni hai) ya "Soap 8 pcs" (naam bhi badalna hai)',
-        parse_mode="HTML",
+        '"8 pcs" (sirf qty badalni hai) ya "Soap 8 pcs" (naam bhi badalna hai)'
+    )
+    _show_in_confirmation_message(ukey, data, text, EDIT_CANCEL_MENU)
+
+
+def cancel_item_edit(ukey):
+    """'Wapas list pe jao' tap — drops back to the confirmation list unchanged,
+    editing the same message rather than sending a new one."""
+    awaiting_item_edit.pop(ukey, None)
+    data = pending_stock_confirmation.get(ukey)
+    if not data:
+        return
+    _show_in_confirmation_message(
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
     )
 
 
 def apply_item_edit(ukey, text):
     """Reply to handle_item_edit_tap's prompt — updates one item in place and
-    re-shows the confirmation (with fresh edit buttons) so more items can be
-    fixed, or the delivery confirmed, in the same pass."""
-    chat_id = ukey[0]
+    edits the same confirmation message back (with fresh edit buttons) so more
+    items can be fixed, or the delivery confirmed, without piling up messages."""
     index = awaiting_item_edit.pop(ukey)
     data = pending_stock_confirmation.get(ukey)
     if not data or index >= len(data["items"]):
@@ -998,15 +1044,16 @@ def apply_item_edit(ukey, text):
     current = data["items"][index]
     parsed = _parse_item_edit_reply(text, current["name"])
     if parsed is None:
-        send_message(chat_id, 'Samajh nahi aaya. Qty ke saath batao, jaise: "8 pcs"')
         awaiting_item_edit[ukey] = index
+        retry_text = (
+            'Samajh nahi aaya. Qty ke saath batao, jaise: "8 pcs"\n\n'
+            f"<b>{html.escape(current['name'])}</b> ki sahi qty/naam batao:"
+        )
+        _show_in_confirmation_message(ukey, data, retry_text, EDIT_CANCEL_MENU)
         return
     data["items"][index] = parsed
-    send_message(
-        chat_id,
-        format_stock_confirmation(data["vendor_name"], data["items"]),
-        parse_mode="HTML",
-        reply_markup=build_confirmation_menu(data["items"]),
+    _show_in_confirmation_message(
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
     )
 
 
@@ -1047,9 +1094,13 @@ def handle_callback_query(cq):
     elif data.startswith("edit_item:") and ukey in pending_stock_confirmation:
         handle_item_edit_tap(ukey, int(data.split(":", 1)[1]))
 
+    elif data == "cancel_item_edit" and ukey in pending_stock_confirmation:
+        cancel_item_edit(ukey)
+
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
-        pending_stock_confirmation.pop(ukey, None)
-        send_message(chat_id, "Theek hai, cancel kar diya.")
+        cancelled = pending_stock_confirmation.pop(ukey, None)
+        awaiting_item_edit.pop(ukey, None)
+        _show_in_confirmation_message(ukey, cancelled or {}, "Theek hai, cancel kar diya.", {"inline_keyboard": []})
 
     elif data == "delete_confirm_yes" and ukey in pending_delete_confirmation:
         confirm_delete(ukey)
@@ -1207,15 +1258,13 @@ def handle_update(update):
         confirm_stock_addition(ukey)
 
     elif ukey in pending_stock_confirmation and (text == BTN_NO or text.lower() in NO_WORDS):
-        pending_stock_confirmation.pop(ukey)
-        send_message(chat_id, "Theek hai, cancel kar diya.")
+        cancelled = pending_stock_confirmation.pop(ukey)
+        _show_in_confirmation_message(ukey, cancelled, "Theek hai, cancel kar diya.", {"inline_keyboard": []})
 
     elif ukey in pending_stock_confirmation:
-        items = pending_stock_confirmation[ukey]["items"]
-        send_message(
-            chat_id,
-            "Sab sahi hai to confirm karo, ya kisi item ko edit karo.",
-            reply_markup=build_confirmation_menu(items),
+        data = pending_stock_confirmation[ukey]
+        _show_in_confirmation_message(
+            ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
         )
 
     elif ukey in pending_delete_confirmation and (text == BTN_DELETE_YES or text.lower() in YES_WORDS):
