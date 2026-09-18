@@ -108,12 +108,19 @@ BTN_YES = "✅ Sab sahi hai"
 BTN_NO = "❌ Nahi, cancel"
 
 
-def build_confirmation_menu(vendor_name, items):
+def build_confirmation_menu(ukey, vendor_name, items):
     """Confirm/cancel row, plus a WebApp edit button when we have a public URL
     to open (see build_edit_webapp_url) — a real editable form instead of the
-    tap-then-type-in-chat flow, which felt clunky even kept to one message."""
+    tap-then-type-in-chat flow, which felt clunky even kept to one message.
+
+    Telegram only allows web_app buttons in a private chat with the bot — a
+    group chat (negative chat_id) rejects the whole sendMessage/editMessageText
+    call with BUTTON_TYPE_INVALID if one is included, which previously got a
+    group stuck (every retry hit the same error). So the edit button is
+    skipped entirely there; group chats fall back to cancel-and-redo."""
+    chat_id = ukey[0]
     keyboard = []
-    edit_url = build_edit_webapp_url(vendor_name, items)
+    edit_url = build_edit_webapp_url(vendor_name, items) if chat_id > 0 else None
     if edit_url:
         keyboard.append([{"text": "✏️ List edit karo", "web_app": {"url": edit_url}}])
     keyboard.append([{"text": BTN_YES, "callback_data": "confirm_yes"}])
@@ -949,7 +956,7 @@ def process_stock_photo(ukey, vendor_name, file_path):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein. Dusri photo try karo.")
             return False
-        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(vendor_name, items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(ukey, vendor_name, items))
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
@@ -972,7 +979,7 @@ def process_stock_manual(ukey, vendor_name, text):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi. Phir se batao, jaise: \"Biscuit 20 pcs\"")
             return False
-        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(vendor_name, items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(ukey, vendor_name, items))
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
@@ -1038,7 +1045,7 @@ def handle_webapp_edit(ukey, raw_data):
         return
     data["items"] = cleaned
     _show_in_confirmation_message(
-        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["vendor_name"], data["items"])
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(ukey, data["vendor_name"], data["items"])
     )
 
 
@@ -1249,7 +1256,7 @@ def handle_update(update):
     elif ukey in pending_stock_confirmation:
         data = pending_stock_confirmation[ukey]
         _show_in_confirmation_message(
-            ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["vendor_name"], data["items"])
+            ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(ukey, data["vendor_name"], data["items"])
         )
 
     elif ukey in pending_delete_confirmation and (text == BTN_DELETE_YES or text.lower() in YES_WORDS):
