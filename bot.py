@@ -17,9 +17,11 @@ flow). chat_id is still what messages get sent to; sender_id is who's mid-flow.
 
 import base64
 import html
+import http.server
+import json
 import os
-import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -37,6 +39,29 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 API_ROOT = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_ROOT = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
+
+# Railway sets this once a public domain exists for the service (see the "List
+# edit karo" WebApp button below) — a Telegram web_app URL must be HTTPS, so
+# without a domain configured (e.g. running locally) that button is just
+# skipped rather than sent broken.
+PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+WEBAPP_PORT = int(os.environ.get("PORT", "8080"))
+
+
+def build_edit_webapp_url(vendor_name, items):
+    """A stock-add confirmation's items, packed into the URL of a small HTML
+    form (served by _WebAppHandler below) that Telegram opens in place — the
+    form reads this same payload back out of its own URL, so no server-side
+    session/lookup is needed. None if there's no public HTTPS domain to use."""
+    if not PUBLIC_DOMAIN:
+        return None
+    payload = {
+        "vendor": vendor_name,
+        "items": [{"name": i["name"], "qty": i["qty"], "unit": i.get("unit")} for i in items],
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    return f"https://{PUBLIC_DOMAIN}/edit?d={encoded}"
+
 
 BOT_NAME = "Genie"
 LOW_CONFIDENCE_THRESHOLD = 0.6  # same cutoff as checker.py's retired LOW_CONFIDENCE rule
@@ -64,7 +89,6 @@ awaiting_stock_manual_text = {}  # (chat_id, sender_id) -> vendor_name, waiting 
 pending_stock_confirmation = {}  # (chat_id, sender_id) -> {"vendor_name", "items"}, waiting yes/no
 awaiting_photo_purpose = {}  # (chat_id, sender_id) -> (vendor_name, file_path), waiting "stock ya summary?"
 pending_delete_confirmation = {}  # (chat_id, sender_id) -> {"target": "item"|"vendor", "vendor_name", "item_name"}, waiting yes/no
-awaiting_item_edit = {}  # (chat_id, sender_id) -> index into pending_stock_confirmation[ukey]["items"], waiting for corrected qty/name
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
@@ -84,11 +108,14 @@ BTN_YES = "✅ Sab sahi hai"
 BTN_NO = "❌ Nahi, cancel"
 
 
-def build_confirmation_menu(items):
-    """One '✏️ <item>' button per item (tap to fix just that item's qty/name) plus
-    the usual confirm/cancel row — so fixing one wrong line doesn't mean retyping
-    the whole delivery list."""
-    keyboard = [[{"text": f"✏️ {item['name']}", "callback_data": f"edit_item:{i}"}] for i, item in enumerate(items)]
+def build_confirmation_menu(vendor_name, items):
+    """Confirm/cancel row, plus a WebApp edit button when we have a public URL
+    to open (see build_edit_webapp_url) — a real editable form instead of the
+    tap-then-type-in-chat flow, which felt clunky even kept to one message."""
+    keyboard = []
+    edit_url = build_edit_webapp_url(vendor_name, items)
+    if edit_url:
+        keyboard.append([{"text": "✏️ List edit karo", "web_app": {"url": edit_url}}])
     keyboard.append([{"text": BTN_YES, "callback_data": "confirm_yes"}])
     keyboard.append([{"text": BTN_NO, "callback_data": "confirm_no"}])
     return {"inline_keyboard": keyboard}
@@ -130,7 +157,6 @@ def clear_stock_flow(ukey):
     awaiting_stock_photo.pop(ukey, None)
     awaiting_stock_manual_text.pop(ukey, None)
     pending_stock_confirmation.pop(ukey, None)
-    awaiting_item_edit.pop(ukey, None)
     awaiting_photo_purpose.pop(ukey, None)
     pending_delete_confirmation.pop(ukey, None)
 
@@ -923,7 +949,7 @@ def process_stock_photo(ukey, vendor_name, file_path):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi is photo mein. Dusri photo try karo.")
             return False
-        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(vendor_name, items))
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
@@ -946,7 +972,7 @@ def process_stock_manual(ukey, vendor_name, text):
         if not items:
             send_message(chat_id, "Koi item/quantity samajh nahi aayi. Phir se batao, jaise: \"Biscuit 20 pcs\"")
             return False
-        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(items))
+        message_id = send_message(chat_id, format_stock_confirmation(vendor_name, items), parse_mode="HTML", reply_markup=build_confirmation_menu(vendor_name, items))
         pending_stock_confirmation[ukey] = {"vendor_name": vendor_name, "items": items, "message_id": message_id}
         return True
     except Exception:
@@ -987,73 +1013,32 @@ def confirm_stock_addition(ukey):
     _show_in_confirmation_message(ukey, data, header + "\n\n" + "\n".join(lines), {"inline_keyboard": []})
 
 
-ITEM_EDIT_PATTERN = re.compile(r"^(?P<name>.*?)\s*(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]+)?\s*$")
-
-EDIT_CANCEL_MENU = {"inline_keyboard": [[{"text": "🔙 Wapas list pe jao", "callback_data": "cancel_item_edit"}]]}
-
-
-def _parse_item_edit_reply(text, current_name):
-    """Parses a per-item correction: 'qty', 'qty unit', or 'new name qty unit' —
-    a name is optional (keeps current_name if left out), a qty is not. Local
-    regex instead of another Gemini call: this is a single short reply about one
-    already-known item, not free-form extraction, so a deterministic parse is
-    both faster and more predictable than an API round trip."""
-    match = ITEM_EDIT_PATTERN.match(text.strip())
-    if not match or not match.group("qty"):
-        return None
-    name = match.group("name").strip() or current_name
-    return {"name": name, "qty": float(match.group("qty")), "unit": match.group("unit")}
-
-
-def handle_item_edit_tap(ukey, index):
-    """User tapped '✏️ <item>' on a pending stock confirmation — edits that same
-    message to ask just for this one item's corrected qty/name, instead of
-    sending a new message (and instead of making them retype everything)."""
-    data = pending_stock_confirmation.get(ukey)
-    if not data or index >= len(data["items"]):
-        return
-    awaiting_item_edit[ukey] = index
-    item = data["items"][index]
-    text = (
-        f"<b>{html.escape(item['name'])}</b> ki sahi qty/naam batao, jaise:\n"
-        '"8 pcs" (sirf qty badalni hai) ya "Soap 8 pcs" (naam bhi badalna hai)'
-    )
-    _show_in_confirmation_message(ukey, data, text, EDIT_CANCEL_MENU)
-
-
-def cancel_item_edit(ukey):
-    """'Wapas list pe jao' tap — drops back to the confirmation list unchanged,
-    editing the same message rather than sending a new one."""
-    awaiting_item_edit.pop(ukey, None)
+def handle_webapp_edit(ukey, raw_data):
+    """A person saved the '✏️ List edit karo' form — Telegram delivers whatever
+    it passed to sendData() as a normal message with web_app_data on it. Same
+    trust level as any text reply (it only reaches us via a real Telegram
+    update from this user), so no extra verification beyond the usual shape
+    check. Malformed/empty payload leaves the pending confirmation untouched
+    rather than guessing — missing data over invented data, as elsewhere."""
+    chat_id = ukey[0]
     data = pending_stock_confirmation.get(ukey)
     if not data:
         return
-    _show_in_confirmation_message(
-        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
-    )
-
-
-def apply_item_edit(ukey, text):
-    """Reply to handle_item_edit_tap's prompt — updates one item in place and
-    edits the same confirmation message back (with fresh edit buttons) so more
-    items can be fixed, or the delivery confirmed, without piling up messages."""
-    index = awaiting_item_edit.pop(ukey)
-    data = pending_stock_confirmation.get(ukey)
-    if not data or index >= len(data["items"]):
+    try:
+        items = json.loads(raw_data).get("items", [])
+        cleaned = [
+            {"name": str(i["name"]).strip(), "qty": float(i["qty"]), "unit": (i.get("unit") or None)}
+            for i in items
+            if str(i.get("name") or "").strip() and i.get("qty") not in (None, "")
+        ]
+    except (ValueError, TypeError, KeyError):
+        cleaned = []
+    if not cleaned:
+        send_message(chat_id, "Form se kuch samajh nahi aaya. Dobara try karo.")
         return
-    current = data["items"][index]
-    parsed = _parse_item_edit_reply(text, current["name"])
-    if parsed is None:
-        awaiting_item_edit[ukey] = index
-        retry_text = (
-            'Samajh nahi aaya. Qty ke saath batao, jaise: "8 pcs"\n\n'
-            f"<b>{html.escape(current['name'])}</b> ki sahi qty/naam batao:"
-        )
-        _show_in_confirmation_message(ukey, data, retry_text, EDIT_CANCEL_MENU)
-        return
-    data["items"][index] = parsed
+    data["items"] = cleaned
     _show_in_confirmation_message(
-        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
+        ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["vendor_name"], data["items"])
     )
 
 
@@ -1091,15 +1076,8 @@ def handle_callback_query(cq):
     elif data == "confirm_yes" and ukey in pending_stock_confirmation:
         confirm_stock_addition(ukey)
 
-    elif data.startswith("edit_item:") and ukey in pending_stock_confirmation:
-        handle_item_edit_tap(ukey, int(data.split(":", 1)[1]))
-
-    elif data == "cancel_item_edit" and ukey in pending_stock_confirmation:
-        cancel_item_edit(ukey)
-
     elif data == "confirm_no" and ukey in pending_stock_confirmation:
         cancelled = pending_stock_confirmation.pop(ukey, None)
-        awaiting_item_edit.pop(ukey, None)
         _show_in_confirmation_message(ukey, cancelled or {}, "Theek hai, cancel kar diya.", {"inline_keyboard": []})
 
     elif data == "delete_confirm_yes" and ukey in pending_delete_confirmation:
@@ -1126,7 +1104,13 @@ def handle_update(update):
     print(f"DEBUG update: ukey={ukey} keys={list(message.keys())} text={message.get('text')!r}", flush=True)
     if not chat_id:
         return
-    if "text" not in message and "photo" not in message and "document" not in message and "voice" not in message:
+    if (
+        "text" not in message
+        and "photo" not in message
+        and "document" not in message
+        and "voice" not in message
+        and "web_app_data" not in message
+    ):
         return  # ignore group system messages: joins, leaves, pins, etc.
 
     # New sender in this chat: check for a saved name first (survives restarts),
@@ -1167,6 +1151,10 @@ def handle_update(update):
                     pending_photo[ukey] = path
             send_message(chat_id, f"{time_greeting()}! Main {BOT_NAME} hoon. Pehle apna naam bata do?")
             return
+
+    if "web_app_data" in message:
+        handle_webapp_edit(ukey, message["web_app_data"].get("data", ""))
+        return
 
     # Photo / PDF: which flow is active decides what happens to it.
     if "photo" in message or "document" in message:
@@ -1251,9 +1239,6 @@ def handle_update(update):
         if process_stock_manual(ukey, vendor_name, text):
             awaiting_stock_manual_text.pop(ukey, None)
 
-    elif ukey in awaiting_item_edit:
-        apply_item_edit(ukey, text)
-
     elif ukey in pending_stock_confirmation and (text == BTN_YES or text.lower() in YES_WORDS):
         confirm_stock_addition(ukey)
 
@@ -1264,7 +1249,7 @@ def handle_update(update):
     elif ukey in pending_stock_confirmation:
         data = pending_stock_confirmation[ukey]
         _show_in_confirmation_message(
-            ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["items"])
+            ukey, data, format_stock_confirmation(data["vendor_name"], data["items"]), build_confirmation_menu(data["vendor_name"], data["items"])
         )
 
     elif ukey in pending_delete_confirmation and (text == BTN_DELETE_YES or text.lower() in YES_WORDS):
@@ -1377,9 +1362,241 @@ def maybe_send_daily_digests():
         send_message(chat_id, format_daily_digest(conn, owner_id, low_items), parse_mode="HTML")
 
 
+# The "List edit karo" WebApp page (build_edit_webapp_url above builds its URL).
+# Fully self-contained and static: all the data it needs travels in its own
+# query string, and saving hands the result back to Telegram itself (sendData),
+# which delivers it to this same bot as a normal update — so this page never
+# calls back to our server, and _WebAppRequestHandler below has nothing to look
+# up or store, just this one HTML string to serve.
+EDIT_PAGE_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edit karo</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #ffffff;
+    --text: #111111;
+    --hint: #707579;
+    --button: #2481cc;
+    --button-text: #ffffff;
+    --border: #e3e3e3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px 16px 80px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .hint { color: var(--hint); font-size: 13px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row input {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 15px;
+    background: transparent;
+    color: var(--text);
+    min-width: 0;
+  }
+  .row input.name { flex: 3; }
+  .row input.qty { flex: 1.2; }
+  .row input.unit { flex: 1; }
+  .row button.remove {
+    border: none;
+    background: none;
+    font-size: 18px;
+    padding: 6px;
+    cursor: pointer;
+    color: #e04b4b;
+  }
+  #add-row {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    margin-top: 8px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--button);
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .error { color: #e04b4b; font-size: 13px; margin-top: 12px; display: none; }
+  #fallback-save {
+    display: block;
+    width: 100%;
+    padding: 12px;
+    margin-top: 16px;
+    border: none;
+    border-radius: 8px;
+    background: var(--button);
+    color: var(--button-text);
+    font-size: 15px;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <h1 id="vendor-name">Stock</h1>
+  <div class="hint">Item ki qty/naam/unit badal sakte ho. 🗑 se hatao, + se naya jodo.</div>
+  <div id="rows"></div>
+  <button id="add-row" type="button">+ Item jodo</button>
+  <div class="error" id="error-msg"></div>
+
+<script>
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  function applyTheme() {
+    if (!tg || !tg.themeParams) return;
+    var p = tg.themeParams;
+    var root = document.documentElement.style;
+    if (p.bg_color) root.setProperty('--bg', p.bg_color);
+    if (p.text_color) root.setProperty('--text', p.text_color);
+    if (p.hint_color) root.setProperty('--hint', p.hint_color);
+    if (p.button_color) root.setProperty('--button', p.button_color);
+    if (p.button_text_color) root.setProperty('--button-text', p.button_text_color);
+  }
+  applyTheme();
+  if (tg) tg.onEvent('themeChanged', applyTheme);
+
+  function b64urlDecode(str) {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) str += '=';
+    var binary = atob(str);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  var params = new URLSearchParams(window.location.search);
+  var payload = { vendor: '', items: [] };
+  try {
+    payload = JSON.parse(b64urlDecode(params.get('d') || ''));
+  } catch (e) {
+    var errEl0 = document.getElementById('error-msg');
+    errEl0.textContent = 'Data load nahi hua. Bot mein wapas try karo.';
+    errEl0.style.display = 'block';
+  }
+
+  document.getElementById('vendor-name').textContent = (payload.vendor || 'Stock') + ' se ye mila';
+
+  var rowsEl = document.getElementById('rows');
+
+  function addRow(item) {
+    item = item || { name: '', qty: '', unit: '' };
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML =
+      '<input class="name" type="text" placeholder="Item naam">' +
+      '<input class="qty" type="number" step="any" placeholder="Qty">' +
+      '<input class="unit" type="text" placeholder="Unit">' +
+      '<button class="remove" type="button">🗑</button>';
+    row.querySelector('.name').value = item.name || '';
+    row.querySelector('.qty').value = (item.qty === null || item.qty === undefined) ? '' : item.qty;
+    row.querySelector('.unit').value = item.unit || '';
+    row.querySelector('.remove').onclick = function () { row.remove(); };
+    rowsEl.appendChild(row);
+  }
+
+  (payload.items || []).forEach(addRow);
+  if (!payload.items || !payload.items.length) addRow();
+
+  document.getElementById('add-row').onclick = function () { addRow(); };
+
+  function collectItems() {
+    var out = [];
+    var bad = false;
+    rowsEl.querySelectorAll('.row').forEach(function (row) {
+      var name = row.querySelector('.name').value.trim();
+      var qtyRaw = row.querySelector('.qty').value.trim();
+      var unit = row.querySelector('.unit').value.trim();
+      if (!name && !qtyRaw) return; // fully blank row, silently skip
+      var qty = parseFloat(qtyRaw);
+      if (!name || qtyRaw === '' || isNaN(qty)) { bad = true; return; }
+      out.push({ name: name, qty: qty, unit: unit || null });
+    });
+    return bad ? null : out;
+  }
+
+  function trySave() {
+    var items = collectItems();
+    var errEl = document.getElementById('error-msg');
+    if (items === null) {
+      errEl.textContent = 'Har item ka naam aur qty dono bharo (ya poori row khaali chhod do).';
+      errEl.style.display = 'block';
+      return;
+    }
+    if (!items.length) {
+      errEl.textContent = 'Kam se kam ek item rakho.';
+      errEl.style.display = 'block';
+      return;
+    }
+    errEl.style.display = 'none';
+    if (tg) {
+      tg.sendData(JSON.stringify({ items: items }));
+      tg.close();
+    } else {
+      alert('Ye page sirf Telegram ke andar kaam karta hai.');
+    }
+  }
+
+  if (tg) {
+    tg.MainButton.setText('Save karo');
+    tg.MainButton.show();
+    tg.MainButton.onClick(trySave);
+  } else {
+    var fallbackBtn = document.createElement('button');
+    fallbackBtn.id = 'fallback-save';
+    fallbackBtn.textContent = 'Save karo';
+    fallbackBtn.onclick = trySave;
+    document.body.appendChild(fallbackBtn);
+  }
+</script>
+</body>
+</html>
+"""
+
+
+class _WebAppRequestHandler(http.server.BaseHTTPRequestHandler):
+    """Serves exactly one static page (EDIT_PAGE_HTML) at /edit — no routing or
+    per-request state, since the page carries its own data in its URL."""
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/edit":
+            body = EDIT_PAGE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # keep Railway logs focused on bot activity, not every HTTP hit
+
+
+def start_webapp_server():
+    """Runs the edit-form HTTP server in a background thread alongside the
+    Telegram long-poll loop in main() — same process, same deploy, just also
+    listening on $PORT so Railway's public domain can reach it."""
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", WEBAPP_PORT), _WebAppRequestHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"WebApp edit form serving on :{WEBAPP_PORT}", flush=True)
+
+
 def main():
     if not BOT_TOKEN:
         sys.exit("TELEGRAM_BOT_TOKEN not set. export TELEGRAM_BOT_TOKEN=...")
+    start_webapp_server()
     print("Bot chalu hai. Ctrl+C se roko.", flush=True)
     offset = None
     while True:
