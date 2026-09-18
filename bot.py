@@ -41,7 +41,7 @@ PROVIDER = os.environ.get("BILLCHECK_PROVIDER", "gemini")
 BOT_NAME = "Genie"
 LOW_CONFIDENCE_THRESHOLD = 0.6  # same cutoff as checker.py's retired LOW_CONFIDENCE rule
 WELCOME = (
-    "Kya karna hai?\n\n"
+    "Chaliye batao — aaj kya karna hai?\n\n"
     "1️⃣ Read & Summarize Invoice — bill ki photo ya PDF bhejo, summary milega "
     "(vendor, items, quantity, price, tax, total)\n\n"
     "2️⃣ Add Items to Stock — vendor se jo maal aaya wo apne stock mein jama karo, "
@@ -1153,7 +1153,7 @@ def handle_update(update):
             # before this bot switched to inline buttons. Can't combine remove_keyboard
             # and inline_keyboard in the same message, so this takes two sends.
             send_message(chat_id, "🔔", reply_markup={"remove_keyboard": True})
-            send_message(chat_id, f"Dhanyawad, {name}! {WELCOME}", reply_markup=MAIN_MENU)
+            send_message(chat_id, f"Dhanyawad, {name}! Kaise ho aap? 😊\n\n{WELCOME}", reply_markup=MAIN_MENU)
             if ukey in pending_photo:
                 process_summarize(ukey, pending_photo.pop(ukey))
             return
