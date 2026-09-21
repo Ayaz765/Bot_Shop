@@ -1,6 +1,7 @@
 """SQLite storage: past invoices, per-item rate history, running mismatch totals."""
 
 import difflib
+import math
 import os
 import re
 import sqlite3
@@ -586,18 +587,12 @@ MIN_SALE_DATAPOINTS = 3  # fewer sale records than this and a daily-rate guess i
 MIN_SALE_SPAN_DAYS = 2  # sales bunched within a day or so don't reveal an actual daily rate
 
 
-def estimate_days_left(conn, owner_id, vendor_name, item_name, current_qty):
-    """Rough days-until-stockout from this item's own sale history: total units
-    sold over the span between its first and last recorded sale gives an average
-    daily rate, and current_qty / that rate is the forecast.
-
-    Returns None — not a lowball guess — when there isn't enough sale history to
-    trust a rate (see MIN_SALE_DATAPOINTS/MIN_SALE_SPAN_DAYS), when nothing has
-    sold, or when current_qty is already 0 or negative (already out, not a
-    forecast question). A wrong forecast costs more shopkeeper trust than no
-    forecast at all — same reasoning as checker.py's false-alarm rule."""
-    if current_qty is None or current_qty <= 0:
-        return None
+def _estimate_daily_rate(conn, owner_id, vendor_name, item_name):
+    """Average units/day sold, from the span between this item's first and
+    last recorded sale — feeds suggest_reorder. None when there isn't enough
+    sale history to trust a rate (see MIN_SALE_DATAPOINTS/MIN_SALE_SPAN_DAYS)
+    — a wrong rate costs more shopkeeper trust than no forecast at all, same
+    reasoning as checker.py's false-alarm rule."""
     rows = conn.execute(
         "SELECT change, created_at FROM stock_movements "
         "WHERE owner_id = ? AND vendor_name = ? AND item_name = ? AND reason = 'sale' "
@@ -616,8 +611,25 @@ def estimate_days_left(conn, owner_id, vendor_name, item_name, current_qty):
     if span_days < MIN_SALE_SPAN_DAYS:
         return None
 
-    daily_rate = total_sold / span_days
-    return current_qty / daily_rate
+    return total_sold / span_days
+
+
+def suggest_reorder(conn, owner_id, vendor_name, item_name, current_qty, horizon_days=7):
+    """Projected demand for the next horizon_days (daily rate × horizon) vs.
+    current_qty — if projected demand exceeds what's on hand, returns how much
+    short you'll be (round up, ordering fractionally makes no sense). None
+    when there's no trustworthy rate, or when current stock already covers
+    the horizon (nothing to suggest)."""
+    if current_qty is None:
+        current_qty = 0
+    daily_rate = _estimate_daily_rate(conn, owner_id, vendor_name, item_name)
+    if daily_rate is None:
+        return None
+    projected_demand = daily_rate * horizon_days
+    shortfall = projected_demand - current_qty
+    if shortfall <= 0:
+        return None
+    return {"horizon_days": horizon_days, "projected_demand": projected_demand, "shortfall": math.ceil(shortfall)}
 
 
 def undo_last_movement(conn, owner_id):
@@ -706,6 +718,22 @@ def get_low_stock_items(conn, owner_id, threshold):
         (owner_id, threshold),
     ).fetchall()
     return [{"vendor_name": r[0], "item_name": r[1], "unit": r[2], "qty": r[3]} for r in rows]
+
+
+def get_items_needing_reorder(conn, owner_id, horizon_days=7):
+    """Every (vendor, item) whose sale rate says current stock won't cover the
+    next horizon_days — unlike get_low_stock_items, this isn't gated on raw
+    qty being below LOW_STOCK_THRESHOLD, so it also catches a fast-moving item
+    that still looks "comfortable" today but is on track to run out before
+    anyone thinks to reorder it. Only items with a trustworthy sale-rate
+    estimate are considered (see suggest_reorder / _estimate_daily_rate)."""
+    rows = conn.execute("SELECT vendor_name, item_name, unit, qty FROM stock WHERE owner_id = ?", (owner_id,)).fetchall()
+    out = []
+    for vendor, item, unit, qty in rows:
+        suggestion = suggest_reorder(conn, owner_id, vendor, item, qty, horizon_days)
+        if suggestion:
+            out.append({"vendor_name": vendor, "item_name": item, "unit": unit, "qty": qty, **suggestion})
+    return out
 
 
 def get_last_digest_date(conn, owner_id):

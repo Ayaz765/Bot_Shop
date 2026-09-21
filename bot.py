@@ -528,9 +528,9 @@ def format_stock_report(conn, owner_id, vendor_name, items):
 
     name_width = min(max(len(item["item_name"]) for item in items), 18)
     rows = []
-    forecasts = []  # low items with a trustworthy days-left estimate, shown below the table
-    low_count = 0
-    for item in items:
+    reorder_lines = []  # items whose sale rate says they won't last the week — checked for every
+    low_count = 0       # item, not just ones already below LOW_STOCK_THRESHOLD, so a fast-moving
+    for item in items:  # item still showing a "comfortable" qty gets caught before it runs out
         qty = item["qty"]
         marker = ""
         if qty < 0:
@@ -539,9 +539,13 @@ def format_stock_report(conn, owner_id, vendor_name, items):
         elif qty <= LOW_STOCK_THRESHOLD:
             marker = " 📉"
             low_count += 1
-            days_left = db.estimate_days_left(conn, owner_id, vendor_name, item["item_name"], qty)
-            if days_left is not None:
-                forecasts.append(f"• {html.escape(item['item_name'])}: {_format_days_left(days_left)} khatam ho sakta hai")
+        suggestion = db.suggest_reorder(conn, owner_id, vendor_name, item["item_name"], qty)
+        if suggestion:
+            reorder_lines.append(
+                f"• {html.escape(item['item_name'])}: agle {suggestion['horizon_days']} din mein "
+                f"~{fmt_qty(round(suggestion['projected_demand']), item.get('unit'))} bikega — "
+                f"{fmt_qty(suggestion['shortfall'], item.get('unit'))} order kar lo"
+            )
         row = f"{_pad(item['item_name'], name_width)}  {fmt_qty(qty, item.get('unit'))}{marker}"
         last_delivery = _format_ist_date(item.get("last_delivery"))
         if last_delivery:
@@ -554,8 +558,8 @@ def format_stock_report(conn, owner_id, vendor_name, items):
 
     table = html.escape("\n".join(rows))
     out = f"📦 <b>{html.escape(vendor_name)} ka stock</b>\n\n<pre>{table}</pre>\n{summary}"
-    if forecasts:
-        out += "\n\n🔮 <b>Andaza (bikri ki raftaar se):</b>\n" + "\n".join(forecasts)
+    if reorder_lines:
+        out += "\n\n🛒 <b>Order kar lo:</b>\n" + "\n".join(reorder_lines)
     return out
 
 
@@ -834,13 +838,6 @@ def handle_sales_insight(ukey, vendor_name):
 LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
 
 
-def _format_days_left(days_left):
-    """'~0 din' reads wrong when the rate says it's basically out already."""
-    if days_left < 1:
-        return "bahut jald"
-    return f"~{days_left:.0f} din mein"
-
-
 def _sale_line(conn, owner_id, vendor, matched_item, new_qty, matched_unit, qty_sold):
     line = f"• {html.escape(matched_item)}: {fmt_qty(new_qty, matched_unit)} bacha"
     qty_before = new_qty + qty_sold
@@ -850,9 +847,12 @@ def _sale_line(conn, owner_id, vendor, matched_item, new_qty, matched_unit, qty_
         # only fires the sale that crosses the line, not every sale after — otherwise
         # every subsequent sale of an already-low item would repeat the same nudge
         line += f"\n   📉 Kam bacha hai ({fmt_qty(new_qty, matched_unit)}), mangwa lena."
-        days_left = db.estimate_days_left(conn, owner_id, vendor, matched_item, new_qty)
-        if days_left is not None:
-            line += f" Is raftaar se {_format_days_left(days_left)} khatam ho sakta hai."
+        suggestion = db.suggest_reorder(conn, owner_id, vendor, matched_item, new_qty)
+        if suggestion is not None:
+            line += (
+                f" Agle {suggestion['horizon_days']} din mein ~{fmt_qty(round(suggestion['projected_demand']), matched_unit)} "
+                f"bikega — {fmt_qty(suggestion['shortfall'], matched_unit)} order kar lo."
+            )
     return line
 
 
@@ -1520,25 +1520,40 @@ def _chat_id_for_owner(owner_id):
     return None
 
 
-def format_daily_digest(conn, owner_id, low_items):
-    """Same item name can come from several vendors — group by item name so
-    the alert reads as one combined line per item (total qty across vendors),
-    not a repeated vendor-tagged entry for what's conceptually one item."""
-    lines = ["🌅 <b>Aaj ka stock alert</b>", ""]
+def _group_by_item_name(rows):
+    """Folds rows from different vendors sharing an item name into one group —
+    shared by the digest's low-stock and reorder sections (same reasoning as
+    handle_sales_insight: one line per item, not one per vendor)."""
     by_item = {}
-    for item in low_items:
-        key = item["item_name"].strip().lower()
-        group = by_item.setdefault(key, {"name": item["item_name"], "qty": 0, "unit": item.get("unit"), "vendors": []})
-        group["qty"] += item["qty"]
-        group["vendors"].append(item["vendor_name"])
-    for group in by_item.values():
-        marker = "⚠️" if group["qty"] < 0 else "📉"
-        line = f"{marker} {html.escape(group['name'])}: {fmt_qty(group['qty'], group['unit'])}"
-        if len(group["vendors"]) == 1:
-            days_left = db.estimate_days_left(conn, owner_id, group["vendors"][0], group["name"], group["qty"])
-            if days_left is not None:
-                line += f" — {_format_days_left(days_left)} khatam ho sakta hai"
-        lines.append(line)
+    for row in rows:
+        key = row["item_name"].strip().lower()
+        group = by_item.setdefault(key, {"name": row["item_name"], "unit": row.get("unit"), "rows": []})
+        group["rows"].append(row)
+    return list(by_item.values())
+
+
+def format_daily_digest(conn, owner_id, low_items, reorder_items):
+    lines = ["🌅 <b>Aaj ka stock alert</b>"]
+
+    if low_items:
+        lines.append("")
+        for group in _group_by_item_name(low_items):
+            qty = sum(r["qty"] for r in group["rows"])
+            marker = "⚠️" if qty < 0 else "📉"
+            lines.append(f"{marker} {html.escape(group['name'])}: {fmt_qty(qty, group['unit'])}")
+
+    if reorder_items:
+        lines.append("")
+        lines.append("🛒 <b>Agle hafte ke liye order kar lo:</b>")
+        for group in _group_by_item_name(reorder_items):
+            projected = sum(r["projected_demand"] for r in group["rows"])
+            shortfall = sum(r["shortfall"] for r in group["rows"])
+            horizon = group["rows"][0]["horizon_days"]
+            lines.append(
+                f"• {html.escape(group['name'])}: agle {horizon} din mein ~{fmt_qty(round(projected), group['unit'])} "
+                f"bikega — {fmt_qty(shortfall, group['unit'])} order kar lo"
+            )
+
     return "\n".join(lines)
 
 
@@ -1559,12 +1574,13 @@ def maybe_send_daily_digests():
             continue
         db.set_last_digest_date(conn, owner_id, today)  # mark checked regardless, so a quiet day isn't re-scanned all day
         low_items = db.get_low_stock_items(conn, owner_id, LOW_STOCK_THRESHOLD)
-        if not low_items:
+        reorder_items = db.get_items_needing_reorder(conn, owner_id)
+        if not low_items and not reorder_items:
             continue
         chat_id = _chat_id_for_owner(owner_id)
         if chat_id is None:
             continue
-        send_message(chat_id, format_daily_digest(conn, owner_id, low_items), parse_mode="HTML")
+        send_message(chat_id, format_daily_digest(conn, owner_id, low_items, reorder_items), parse_mode="HTML")
 
 
 # The "List edit karo" WebApp page (build_edit_webapp_url above builds its URL).
