@@ -20,6 +20,7 @@ import html
 import http.server
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -66,6 +67,39 @@ def build_edit_webapp_url(vendor_name, items):
 
 BOT_NAME = "Genie"
 LOW_CONFIDENCE_THRESHOLD = 0.6  # same cutoff as checker.py's retired LOW_CONFIDENCE rule
+
+# Small variety on the highest-traffic prompts/confirmations — the exact same
+# rigid line every single time (for every sale, every restock) reads robotic.
+# Only decorative openers vary; the actual numbers/names right after never do.
+VENDOR_ASK_PROMPTS = [
+    "Kaunse vendor se maal aaya? Naam batao.",
+    "Theek hai! Kis vendor se stock aaya, naam bata do.",
+    "Achha, kaunse vendor ka maal hai ye?",
+]
+PHOTO_OR_MANUAL_PROMPTS = [
+    "Photo bhejoge ya khud type karoge?",
+    "Bill ki photo bhej doge, ya list khud type kar doge?",
+]
+RESTOCK_SUCCESS_OPENERS = [
+    "{vendor} — stock update ho gaya:",
+    "Theek hai, {vendor} ka stock update ho gaya:",
+    "Done! {vendor} ka naya hisaab:",
+    "Ho gaya — {vendor} ka stock ab yeh hai:",
+]
+
+
+def _ask_vendor():
+    return random.choice(VENDOR_ASK_PROMPTS)
+
+
+def _ask_photo_or_manual():
+    return random.choice(PHOTO_OR_MANUAL_PROMPTS)
+
+
+def _restock_success_header(vendor):
+    return f"<b>{random.choice(RESTOCK_SUCCESS_OPENERS).format(vendor=html.escape(vendor))}</b>"
+
+
 WELCOME = (
     "Chaliye batao — aaj kya karna hai?\n\n"
     "1️⃣ Read & Summarize Invoice — bill ki photo ya PDF bhejo, summary milega "
@@ -910,7 +944,7 @@ def handle_restock(ukey, items, vendor_name):
         return
     vendor_name = vendor_name or active_vendor.get(ukey)
     if not vendor_name:
-        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+        send_message(chat_id, _ask_vendor())
         return
 
     conn = db.get_connection()
@@ -932,7 +966,7 @@ def handle_restock(ukey, items, vendor_name):
 
     parts = []
     if lines:
-        parts.append(f"<b>{html.escape(resolved_vendor)}:</b>\n" + "\n".join(lines))
+        parts.append(_restock_success_header(resolved_vendor) + "\n" + "\n".join(lines))
     if missing_qty:
         names = ", ".join(html.escape(n) for n in missing_qty)
         parts.append(f"⚠️ {names} — kitna aaya nahi bataya, quantity ke saath phir se batao.")
@@ -1085,7 +1119,7 @@ def confirm_stock_addition(ukey):
         if item.get("rate") is not None:
             line += f" (Rs{fmt_money(item['rate'])}/each)"
         lines.append(line)
-    header = f"<b>{html.escape(resolved_vendor)} — stock update ho gaya:</b>"
+    header = _restock_success_header(resolved_vendor)
     _show_in_confirmation_message(ukey, data, header + "\n\n" + "\n".join(lines), {"inline_keyboard": []})
 
 
@@ -1210,7 +1244,7 @@ def handle_callback_query(cq):
     elif data == "stock":
         clear_stock_flow(ukey)
         awaiting_stock_vendor.add(ukey)
-        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.")
+        send_message(chat_id, _ask_vendor())
 
     elif data == "stock_photo" and ukey in awaiting_stock_method:
         vendor_name = awaiting_stock_method.pop(ukey)
@@ -1362,7 +1396,7 @@ def handle_update(update):
     elif text == BTN_STOCK:
         clear_stock_flow(ukey)
         awaiting_stock_vendor.add(ukey)
-        send_message(chat_id, "Kaunse vendor se maal aaya? Naam batao.", reply_markup=NO_KEYBOARD)
+        send_message(chat_id, _ask_vendor(), reply_markup=NO_KEYBOARD)
 
     elif ukey in awaiting_stock_vendor and text in ALL_BUTTON_TEXTS:
         send_message(chat_id, "Vendor ka naam likho (button nahi), jaise: Ayaz")
@@ -1374,7 +1408,7 @@ def handle_update(update):
     elif ukey in awaiting_stock_vendor:
         awaiting_stock_vendor.discard(ukey)
         awaiting_stock_method[ukey] = text
-        send_message(chat_id, "Photo bhejoge ya khud type karoge?", reply_markup=STOCK_METHOD_MENU)
+        send_message(chat_id, _ask_photo_or_manual(), reply_markup=STOCK_METHOD_MENU)
 
     elif ukey in awaiting_stock_method and text == BTN_STOCK_PHOTO:
         vendor_name = awaiting_stock_method.pop(ukey)
