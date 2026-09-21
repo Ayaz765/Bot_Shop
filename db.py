@@ -2,6 +2,7 @@
 
 import difflib
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime
@@ -128,7 +129,9 @@ def find_supplier(conn, name):
     """Fuzzy-match a typed supplier name against ones already seen. None if no match."""
     known = [row[0] for row in conn.execute("SELECT DISTINCT supplier_name FROM invoices").fetchall()]
     normalized_to_actual = {_normalize(n): n for n in known}
-    match = difflib.get_close_matches(_normalize(name), normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF)
+    target = _normalize(name)
+    candidates = [k for k in normalized_to_actual if not _numbers_conflict(target, k)]
+    match = difflib.get_close_matches(target, candidates, n=1, cutoff=NAME_MATCH_CUTOFF)
     return normalized_to_actual[match[0]] if match else None
 
 
@@ -171,9 +174,9 @@ def get_rate_history(conn, supplier_name, item_name):
         ).fetchall()
     ]
     normalized_to_actual = {_normalize(name): name for name in known_names}
-    match = difflib.get_close_matches(
-        _normalize(item_name), normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF
-    )
+    target = _normalize(item_name)
+    candidates = [k for k in normalized_to_actual if not _numbers_conflict(target, k)]
+    match = difflib.get_close_matches(target, candidates, n=1, cutoff=NAME_MATCH_CUTOFF)
     if not match:
         return []
     matched_name = normalized_to_actual[match[0]]
@@ -228,10 +231,26 @@ def get_running_total_loss(conn, supplier_name=None):
     return row[0]
 
 
+def _numbers_conflict(a, b):
+    """True if both names contain digits and those digit sequences differ —
+    e.g. "maggi 100g" vs "maggi 200g" scores 0.9 on difflib's ratio (one
+    character out of many), easily clearing NAME_MATCH_CUTOFF, but they're two
+    different pack sizes, not a typo/OCR variant of the same item. Numbers in
+    a product/vendor name are almost always meaningful, unlike letter case or
+    spacing, so a plain similarity score can't be trusted to tell these apart
+    — silently merging two real items is worse than missing a real typo match
+    (same reasoning _find_vendor_exact uses for vendors)."""
+    nums_a = re.findall(r"\d+", a)
+    nums_b = re.findall(r"\d+", b)
+    return bool(nums_a) and bool(nums_b) and nums_a != nums_b
+
+
 def _fuzzy_match(query, known_names):
     """Best match for `query` among `known_names`. Checks substring containment first
     (so a nickname like "Ramesh" finds "Ramesh Traders" — difflib's ratio alone penalizes
-    that length gap too heavily), then falls back to difflib for typos/case/spacing."""
+    that length gap too heavily), then falls back to difflib for typos/case/spacing.
+    Candidates whose numbers conflict with the query's (see _numbers_conflict) are
+    excluded before either check, so different pack sizes never merge."""
     if not known_names:
         return None
     normalized_to_actual = {_normalize(n): n for n in known_names}
@@ -240,13 +259,17 @@ def _fuzzy_match(query, known_names):
     if target in normalized_to_actual:
         return normalized_to_actual[target]
 
-    substring_matches = [n for n in normalized_to_actual if target in n or n in target]
+    candidates = {k: v for k, v in normalized_to_actual.items() if not _numbers_conflict(target, k)}
+    if not candidates:
+        return None
+
+    substring_matches = [n for n in candidates if target in n or n in target]
     if substring_matches:
         best = min(substring_matches, key=lambda n: abs(len(n) - len(target)))
-        return normalized_to_actual[best]
+        return candidates[best]
 
-    close = difflib.get_close_matches(target, normalized_to_actual.keys(), n=1, cutoff=NAME_MATCH_CUTOFF)
-    return normalized_to_actual[close[0]] if close else None
+    close = difflib.get_close_matches(target, candidates.keys(), n=1, cutoff=NAME_MATCH_CUTOFF)
+    return candidates[close[0]] if close else None
 
 
 def _find_vendor_in_stock(conn, owner_id, vendor_name):
@@ -488,6 +511,8 @@ def find_item_across_vendors(conn, owner_id, item_name):
     matches = []
     for vendor, item, unit, qty in rows:
         normalized_item = _normalize(item)
+        if _numbers_conflict(target, normalized_item):
+            continue  # e.g. "maggi 100g" must never match a stocked "maggi 200g"
         is_match = (
             target == normalized_item
             or target in normalized_item

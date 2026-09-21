@@ -480,6 +480,10 @@ def _pad(text, width):
 
 
 def format_stock_report(conn, owner_id, vendor_name, items):
+    # A 0-qty item (fully sold out, nothing wrong) just clutters the list —
+    # drop it from what's shown. Negative qty stays: that's an anomaly (sold
+    # more than was on record) worth flagging, not a normal empty item.
+    items = [item for item in items if item["qty"] != 0]
     if not items:
         return f"📦 {html.escape(vendor_name)} ka koi stock record nahi hai mere paas."
 
@@ -687,6 +691,9 @@ def confirm_delete(ukey):
     send_message(chat_id, f"Theek hai, <b>{html.escape(item)}</b> ko {html.escape(vendor)} ke stock se hata diya.", parse_mode="HTML")
 
 
+MAX_MESSAGE_CHARS = 3500  # Telegram caps at 4096; leave headroom for HTML entities
+
+
 def handle_stock_query(ukey, vendor_name):
     chat_id, owner_id = ukey
     conn = db.get_connection()
@@ -694,9 +701,22 @@ def handle_stock_query(ukey, vendor_name):
         vendors = db.get_vendors(conn, owner_id)
         if not vendors:
             send_message(chat_id, "Abhi koi vendor record nahi hai mere paas.")
-        else:
-            names = ", ".join(html.escape(v) for v in vendors)
-            send_message(chat_id, f"Ye vendors hain: {names}. Kiska stock dekhna hai?")
+            return
+        # No single vendor named — show every vendor's stock together in one
+        # place instead of just listing names and making them ask again per
+        # vendor. Chunked across messages if it's too long for one (Telegram's
+        # 4096-char cap), split cleanly between vendors.
+        chunk = ""
+        for v in vendors:
+            report = format_stock_report(conn, owner_id, v, db.get_stock_with_last_delivery(conn, owner_id, v))
+            candidate = f"{chunk}\n\n{report}" if chunk else report
+            if len(candidate) > MAX_MESSAGE_CHARS and chunk:
+                send_message(chat_id, chunk, parse_mode="HTML")
+                chunk = report
+            else:
+                chunk = candidate
+        if chunk:
+            send_message(chat_id, chunk, parse_mode="HTML")
         return
     active_vendor[ukey] = vendor_name
     items = db.get_stock_with_last_delivery(conn, owner_id, vendor_name)
@@ -1420,13 +1440,23 @@ def _chat_id_for_owner(owner_id):
 
 
 def format_daily_digest(conn, owner_id, low_items):
+    """Same item name can come from several vendors — group by item name so
+    the alert reads as one combined line per item (total qty across vendors),
+    not a repeated vendor-tagged entry for what's conceptually one item."""
     lines = ["🌅 <b>Aaj ka stock alert</b>", ""]
+    by_item = {}
     for item in low_items:
-        marker = "⚠️" if item["qty"] < 0 else "📉"
-        line = f"{marker} {html.escape(item['item_name'])} ({html.escape(item['vendor_name'])}): {fmt_qty(item['qty'], item.get('unit'))}"
-        days_left = db.estimate_days_left(conn, owner_id, item["vendor_name"], item["item_name"], item["qty"])
-        if days_left is not None:
-            line += f" — {_format_days_left(days_left)} khatam ho sakta hai"
+        key = item["item_name"].strip().lower()
+        group = by_item.setdefault(key, {"name": item["item_name"], "qty": 0, "unit": item.get("unit"), "vendors": []})
+        group["qty"] += item["qty"]
+        group["vendors"].append(item["vendor_name"])
+    for group in by_item.values():
+        marker = "⚠️" if group["qty"] < 0 else "📉"
+        line = f"{marker} {html.escape(group['name'])}: {fmt_qty(group['qty'], group['unit'])}"
+        if len(group["vendors"]) == 1:
+            days_left = db.estimate_days_left(conn, owner_id, group["vendors"][0], group["name"], group["qty"])
+            if days_left is not None:
+                line += f" — {_format_days_left(days_left)} khatam ho sakta hai"
         lines.append(line)
     return "\n".join(lines)
 
