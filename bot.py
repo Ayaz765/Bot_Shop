@@ -432,15 +432,22 @@ def fmt_money(amount):
 
 
 def format_stock_confirmation(vendor_name, items):
-    lines = [f"<b>{html.escape(vendor_name)} se ye mila:</b>", ""]
+    # Plain "• name — qty — Rsrate" bullet lines didn't line up at all once
+    # names varied in length — a padded <pre> table (same approach
+    # format_stock_report uses) keeps qty/rate in a straight column instead.
+    name_width = min(max(len(item["name"]) for item in items), 18)
+    rows = []
     for item in items:
-        line = f"• {html.escape(item['name'])} — {fmt_qty(item['qty'], item.get('unit'))}"
+        row = f"{_pad(item['name'], name_width)}  {fmt_qty(item['qty'], item.get('unit'))}"
         if item.get("rate") is not None:
-            line += f" — Rs{fmt_money(item['rate'])}"
-        lines.append(line)
-    lines.append("")
-    lines.append("Sab sahi hai to confirm karo, ya kisi item ka naam tap karke usse edit karo.")
-    return "\n".join(lines)
+            row += f"  Rs{fmt_money(item['rate'])}"
+        rows.append(row)
+    table = html.escape("\n".join(rows))
+    return (
+        f"<b>{html.escape(vendor_name)} se ye mila:</b>\n\n"
+        f"<pre>{table}</pre>\n\n"
+        "Sab sahi hai to confirm karo, ya neeche se edit karo."
+    )
 
 
 def _classify_with_history(user_part, history_label, ukey):
