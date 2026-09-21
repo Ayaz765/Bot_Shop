@@ -185,10 +185,11 @@ ka message text ho sakta hai ya ek bola hua voice note — agar audio hai to peh
 Hinglish/Hindi mein jo bola gaya samjho, phir neeche wahi rules text ki tarah follow karo. Uske \
 baad intent nikaalo, is JSON shape mein (sirf JSON do, kuch aur text nahi):
 
-{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "history" | "delete" | "chat", \
-"items": [{"name": string, "qty": number or null, "unit": string or null, "all": boolean}], \
-"vendor_name": string or null, "old_name": string or null, "new_name": string or null, \
-"rename_target": "item" | "vendor" | null, "delete_target": "item" | "vendor" | null, "reply": string}
+{"intent": "sale" | "restock" | "stock_query" | "undo" | "rename" | "history" | "delete" | \
+"sales_insight" | "chat", "items": [{"name": string, "qty": number or null, "unit": string or \
+null, "all": boolean}], "vendor_name": string or null, "old_name": string or null, "new_name": \
+string or null, "rename_target": "item" | "vendor" | null, "delete_target": "item" | "vendor" | \
+null, "reply": string}
 
 Is conversation ke pichle 1-2 messages bhi tumhe upar mil sakte hain. Agar user "isko", "ye", \
 "wahi wala" jaisa kuch bole, pehle wahi context dekho ki pichle message mein kaunsa item/vendor \
@@ -232,6 +233,10 @@ bharo — sirf tab jab message ya pichle context se saaf pata chale in dono mein
 Agar sirf "hata do"/"delete karo" bola aur item ya vendor ka koi zikar nahi (na isi message mein, \
 na context mein), to delete_target null rakho — khud mat chuno. Jo naam bataya gaya wo item ho to \
 items[0].name mein, vendor ho to vendor_name mein bharo.
+- "sales_insight": user poochh raha hai ki kya sabse zyada/kam bika, best/worst-selling item kaunsa \
+hai. Jaise "sabse zyada kya bika", "kaunsa item sabse kam bika", "best selling item batao", "sabse \
+slow-moving item kaunsa hai". vendor_name bharo agar specific vendor ke liye poocha ho, warna null \
+(sab vendors mila ke).
 - "chat": baaki sab (greeting, casual baat, sawaal jiska jawab tumhare data mein nahi hai). \
 "reply" mein chhota (1-2 line) dostana Hinglish jawab do jaise ek dost deta hai. KABHI BHI koi \
 vendor ka naam, item ka naam, ya stock number khud se mat banao — tumhe pata nahi ki user ke \
@@ -750,6 +755,46 @@ def handle_history(ukey, vendor_name):
         out.extend(item_lines)
         out.append("")
     send_message(chat_id, "\n".join(out).rstrip(), parse_mode="HTML")
+
+
+INSIGHT_RANK_COUNT = 5  # how many items to show on each end of "sabse zyada/kam bika"
+
+
+def handle_sales_insight(ukey, vendor_name):
+    """'Sabse zyada/kam bika kya' — ranks items by total units sold (reason='sale'
+    movements), folding the same item name from different vendors into one
+    total first (same reasoning as format_daily_digest's grouping)."""
+    chat_id, owner_id = ukey
+    conn = db.get_connection()
+    rows = db.get_item_sales_totals(conn, owner_id, vendor_name)
+    if not rows:
+        send_message(chat_id, "Abhi koi sale record nahi hai jisse bata sakun.")
+        return
+    if vendor_name:
+        active_vendor[ukey] = vendor_name
+
+    by_item = {}
+    for r in rows:
+        key = r["item_name"].strip().lower()
+        group = by_item.setdefault(key, {"name": r["item_name"], "unit": r["unit"], "sold": 0})
+        group["sold"] += r["sold"]
+    ranked = sorted(by_item.values(), key=lambda g: g["sold"], reverse=True)
+
+    def _lines(group_list):
+        return [f"{i}. {html.escape(g['name'])} — {fmt_qty(g['sold'], g['unit'])}" for i, g in enumerate(group_list, 1)]
+
+    lines = ["📊 <b>Bikri ka hisaab</b>", "", "<b>Sabse zyada bika:</b>"]
+    top = ranked[:INSIGHT_RANK_COUNT]
+    lines.extend(_lines(top))
+
+    bottom = list(reversed(ranked[-INSIGHT_RANK_COUNT:]))
+    bottom = [g for g in bottom if g not in top]
+    if bottom:
+        lines.append("")
+        lines.append("<b>Sabse kam bika:</b>")
+        lines.extend(_lines(bottom))
+
+    send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 LOW_STOCK_THRESHOLD = 5  # heads-up once stock drops to/below this, so a shortage doesn't go unnoticed
@@ -1420,6 +1465,8 @@ def dispatch_intent(ukey, result):
         items = result.get("items") or []
         item_name = items[0].get("name") if items else None
         handle_delete(ukey, result.get("delete_target"), item_name, result.get("vendor_name"))
+    elif intent == "sales_insight":
+        handle_sales_insight(ukey, result.get("vendor_name"))
     else:
         reply = result.get("reply")
         send_message(chat_id, reply or WELCOME, reply_markup=None if reply else MAIN_MENU)

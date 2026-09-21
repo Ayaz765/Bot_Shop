@@ -524,6 +524,30 @@ def find_item_across_vendors(conn, owner_id, item_name):
     return matches
 
 
+def get_item_sales_totals(conn, owner_id, vendor_name=None):
+    """Total units sold (reason='sale' stock_movements) per (vendor, item),
+    only rows with something actually sold — feeds "sabse zyada/kam bika kya".
+    Left un-grouped across vendors (one row per vendor+item) so the caller can
+    fold same-named items from different vendors into one ranking, same
+    division of labor as get_low_stock_items."""
+    if vendor_name:
+        vendor = _find_vendor_in_stock(conn, owner_id, vendor_name)
+        if not vendor:
+            return []
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, -SUM(change) FROM stock_movements "
+            "WHERE owner_id = ? AND vendor_name = ? AND reason = 'sale' GROUP BY vendor_name, item_name",
+            (owner_id, vendor),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT vendor_name, item_name, unit, -SUM(change) FROM stock_movements "
+            "WHERE owner_id = ? AND reason = 'sale' GROUP BY vendor_name, item_name",
+            (owner_id,),
+        ).fetchall()
+    return [{"vendor_name": r[0], "item_name": r[1], "unit": r[2], "sold": r[3]} for r in rows if r[3] > 0]
+
+
 def record_sale(conn, owner_id, vendor_name, item_name, qty, unit=None, batch_id=None):
     """Sale: subtract qty from a vendor's stock of an item. Not clamped at 0 —
     a negative number is an honest signal something's off, not hidden.
