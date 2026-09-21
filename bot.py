@@ -934,6 +934,17 @@ def handle_restock(ukey, items, vendor_name):
     silently decremented stock instead of adding it."""
     chat_id, owner_id = ukey
     if not items:
+        if not vendor_name:
+            # No items AND no vendor named — they're just announcing a
+            # delivery ("naya vendor se saman aaya hai"), not trying to type
+            # an inline list. Don't fall back to active_vendor here either —
+            # "naya" usually means a DIFFERENT vendor than whoever was last in
+            # focus. Guided flow instead of a dead-end "batao": same as the
+            # "Add Items to Stock" button (ask vendor, then photo-or-type).
+            clear_stock_flow(ukey)
+            awaiting_stock_vendor.add(ukey)
+            send_message(chat_id, _ask_vendor())
+            return
         send_message(
             chat_id,
             "📦 <b>Kya aaya, samajh nahi paaya</b>\n\n"
