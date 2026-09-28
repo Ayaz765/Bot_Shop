@@ -9,10 +9,13 @@ Two menu paths:
 
 Selling something is free-text at any time ("5 Maggi becha") — see Phase E.
 
-All per-conversation state is keyed by (chat_id, sender_id), not chat_id alone —
+All per-conversation state is keyed by (chat_id, owner_id), not chat_id alone —
 in a group chat, multiple real people can talk to the bot, and chat_id alone would
 merge them into one shared identity (person B's message finishing person A's
-flow). chat_id is still what messages get sent to; sender_id is who's mid-flow.
+flow). chat_id is still what messages get sent to; owner_id is who's mid-flow —
+normally the sender's own Telegram id, but resolved through a "link <phone>"
+(see handle_link/db.resolve_owner_id) if they've tied this account to another
+one of their own, so one shopkeeper's several Telegram accounts share one shop.
 """
 
 import base64
@@ -108,23 +111,23 @@ WELCOME = (
     "photo se ya khud type karke"
 )
 
-user_names = {}  # (chat_id, sender_id) -> name, once they've told us
-awaiting_name = set()  # (chat_id, sender_id) currently expected to reply with their name
-pending_photo = {}  # (chat_id, sender_id) -> downloaded file path, if one arrived before we had a name
+user_names = {}  # (chat_id, owner_id) -> name, once they've told us
+awaiting_name = set()  # (chat_id, owner_id) currently expected to reply with their name
+pending_photo = {}  # (chat_id, owner_id) -> downloaded file path, if one arrived before we had a name
 
 CHAT_HISTORY_TURNS = 3  # past exchanges kept per person, so "isko"/"ye" resolve to what was just said
-chat_history = {}  # (chat_id, sender_id) -> [{"role": "user"|"model", "text": str}, ...], oldest first
+chat_history = {}  # (chat_id, owner_id) -> [{"role": "user"|"model", "text": str}, ...], oldest first
 
-active_vendor = {}  # (chat_id, sender_id) -> vendor_name last talked about, so it doesn't need repeating
+active_vendor = {}  # (chat_id, owner_id) -> vendor_name last talked about, so it doesn't need repeating
 
-awaiting_stock_vendor = set()  # (chat_id, sender_id) chose "Add to Stock", waiting for vendor name
-awaiting_stock_method = {}  # (chat_id, sender_id) -> vendor_name, waiting for photo-or-manual choice
-awaiting_stock_photo = {}  # (chat_id, sender_id) -> vendor_name, waiting for the delivery photo
-awaiting_stock_manual_text = {}  # (chat_id, sender_id) -> vendor_name, waiting for typed item list
-pending_stock_confirmation = {}  # (chat_id, sender_id) -> {"vendor_name", "items"}, waiting yes/no
-awaiting_photo_purpose = {}  # (chat_id, sender_id) -> (vendor_name, file_path), waiting "stock ya summary?"
-pending_delete_confirmation = {}  # (chat_id, sender_id) -> {"target": "item"|"vendor", "vendor_name", "item_name"}, waiting yes/no
-awaiting_item_edit = {}  # (chat_id, sender_id) -> index into pending_stock_confirmation[ukey]["items"] — group-chat fallback only (see build_confirmation_menu)
+awaiting_stock_vendor = set()  # (chat_id, owner_id) chose "Add to Stock", waiting for vendor name
+awaiting_stock_method = {}  # (chat_id, owner_id) -> vendor_name, waiting for photo-or-manual choice
+awaiting_stock_photo = {}  # (chat_id, owner_id) -> vendor_name, waiting for the delivery photo
+awaiting_stock_manual_text = {}  # (chat_id, owner_id) -> vendor_name, waiting for typed item list
+pending_stock_confirmation = {}  # (chat_id, owner_id) -> {"vendor_name", "items"}, waiting yes/no
+awaiting_photo_purpose = {}  # (chat_id, owner_id) -> (vendor_name, file_path), waiting "stock ya summary?"
+pending_delete_confirmation = {}  # (chat_id, owner_id) -> {"target": "item"|"vendor", "vendor_name", "item_name"}, waiting yes/no
+awaiting_item_edit = {}  # (chat_id, owner_id) -> index into pending_stock_confirmation[ukey]["items"] — group-chat fallback only (see build_confirmation_menu)
 
 BTN_SUMMARIZE = "1️⃣ Read & Summarize Invoice"
 BTN_STOCK = "2️⃣ Add Items to Stock"
@@ -431,6 +434,38 @@ def fmt_money(amount):
     return text[:-3] if text.endswith(".00") else text
 
 
+def _normalize_phone(text):
+    """Digits only, dropping a leading 0 or +91/91 country code — accepts
+    however the shopkeeper happens to type it. None if it's not a plausible
+    10-digit Indian mobile number."""
+    digits = re.sub(r"\D", "", text)
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else None
+
+
+def handle_link(chat_id, sender_id, phone_text):
+    """"link <phone>" — ties this Telegram account to the shop identity
+    registered under that number (see db.link_account_by_phone), so the same
+    shopkeeper's other Telegram accounts can see one shop's stock/sales."""
+    phone = _normalize_phone(phone_text)
+    if not phone:
+        send_message(chat_id, "10 ank ka number likho, jaise: link 9876543210")
+        return
+    conn = db.get_connection()
+    _, joined_existing = db.link_account_by_phone(conn, sender_id, phone)
+    if joined_existing:
+        send_message(chat_id, "Ho gaya! Ab ye account bhi wahi dukaan ka stock aur record dikhayega.")
+    else:
+        send_message(
+            chat_id,
+            f"Number {phone} save ho gaya. Apne doosre Telegram account se bhi \"link {phone}\" bhejo — "
+            "dono ek hi dukaan ban jayenge.",
+        )
+
+
 def format_stock_confirmation(vendor_name, items):
     # Plain "• name — qty — Rsrate" bullet lines didn't line up at all once
     # names varied in length — a padded <pre> table (same approach
@@ -525,11 +560,16 @@ def _pad(text, width):
     return text.ljust(width)
 
 
+QTY_ZERO_TOLERANCE = 1e-6  # repeated "qty = qty - ?" updates in SQLite leave float
+# residue (e.g. -2.7e-17) instead of an exact 0, so a bare "!= 0" check let those
+# sold-out items sneak back into the stock report as near-zero garbage values.
+
+
 def format_stock_report(conn, owner_id, vendor_name, items):
     # A 0-qty item (fully sold out, nothing wrong) just clutters the list —
     # drop it from what's shown. Negative qty stays: that's an anomaly (sold
     # more than was on record) worth flagging, not a normal empty item.
-    items = [item for item in items if item["qty"] != 0]
+    items = [item for item in items if abs(item["qty"]) > QTY_ZERO_TOLERANCE]
     if not items:
         return f"📦 {html.escape(vendor_name)} ka koi stock record nahi hai mere paas."
 
@@ -1249,7 +1289,8 @@ def handle_callback_query(cq):
     answer_callback(cq["id"])
     chat_id = cq.get("message", {}).get("chat", {}).get("id")
     sender_id = cq.get("from", {}).get("id", chat_id)  # cq["from"] is the tapper, not the bot
-    ukey = (chat_id, sender_id)
+    owner_id = db.resolve_owner_id(db.get_connection(), sender_id)
+    ukey = (chat_id, owner_id)
     data = cq.get("data", "")
     print(f"DEBUG callback: ukey={ukey} data={data!r}", flush=True)
     if not chat_id or ukey not in user_names:
@@ -1308,8 +1349,14 @@ def handle_update(update):
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     sender_id = message.get("from", {}).get("id", chat_id)
-    ukey = (chat_id, sender_id)
-    print(f"DEBUG update: ukey={ukey} keys={list(message.keys())} text={message.get('text')!r}", flush=True)
+    conn = db.get_connection()
+    # sender_id is this specific Telegram account; owner_id is the shop identity
+    # it resolves to (itself, unless linked via "link <phone>" to another
+    # account) — everything past this point (state keys, stock/sale data) uses
+    # owner_id so a shopkeeper's other linked accounts see the same shop.
+    owner_id = db.resolve_owner_id(conn, sender_id)
+    ukey = (chat_id, owner_id)
+    print(f"DEBUG update: ukey={ukey} sender_id={sender_id} keys={list(message.keys())} text={message.get('text')!r}", flush=True)
     if not chat_id:
         return
     if (
@@ -1324,8 +1371,7 @@ def handle_update(update):
     # New sender in this chat: check for a saved name first (survives restarts),
     # then greet by time of day and ask for one before doing anything else.
     if ukey not in user_names:
-        conn = db.get_connection()
-        saved_name = db.get_user_name(conn, sender_id)
+        saved_name = db.get_user_name(conn, owner_id)
         if saved_name:
             user_names[ukey] = saved_name
             # fall through — handled like any other message below, no re-onboarding
@@ -1339,7 +1385,7 @@ def handle_update(update):
                 send_message(chat_id, "Wo naam nahi laga 😅 Bas apna naam likho, jaise: Ramesh")
                 return
             user_names[ukey] = name
-            db.set_user_name(conn, sender_id, name)
+            db.set_user_name(conn, owner_id, name)
             awaiting_name.discard(ukey)
             # One-time cleanup: clears any old-style reply keyboard still showing from
             # before this bot switched to inline buttons. Can't combine remove_keyboard
@@ -1407,7 +1453,15 @@ def handle_update(update):
 
     text = message["text"].strip()
 
-    if text == BTN_SUMMARIZE:
+    if text.lower().startswith("link "):
+        # Deliberately matched here, not routed through interpret_free_text's
+        # Gemini classifier — a phone number is exact data an LLM could
+        # mistranscribe a digit of, which would silently merge the wrong
+        # accounts. sender_id (not owner_id/ukey) is what gets linked, since
+        # that's the specific Telegram account this command is about.
+        handle_link(chat_id, sender_id, text[len("link "):].strip())
+
+    elif text == BTN_SUMMARIZE:
         clear_stock_flow(ukey)
         send_message(chat_id, "Theek hai, bill ki photo ya PDF bhej do.", reply_markup=NO_KEYBOARD)
 
@@ -1529,11 +1583,12 @@ DIGEST_HOUR_IST = 9  # don't message before a shopkeeper's likely awake and at t
 
 def _chat_id_for_owner(owner_id):
     """A proactive digest needs a chat_id to send to, but stock is scoped by
-    owner_id (== sender_id) — find the chat this person last talked to the bot
-    in, from whoever's already onboarded. None if they've never messaged us
+    owner_id — find the chat this person last talked to the bot in, from
+    whoever's already onboarded (user_names keys are already (chat_id,
+    owner_id) — see handle_update). None if they've never messaged us
     (shouldn't happen for an owner_id with stock rows, but not worth a crash)."""
-    for chat_id, sender_id in user_names:
-        if sender_id == owner_id:
+    for chat_id, uid in user_names:
+        if uid == owner_id:
             return chat_id
     return None
 

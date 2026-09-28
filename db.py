@@ -101,6 +101,16 @@ def init_db(conn):
     existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(stock_movements)").fetchall()]
     if "batch_id" not in existing_cols:
         conn.execute("ALTER TABLE stock_movements ADD COLUMN batch_id TEXT")
+
+    # Same-shopkeeper-multiple-Telegram-accounts support: phone is the number a
+    # "primary" account registers via link_account_by_phone; linked_owner_id is
+    # set on a secondary account once it links to that number, pointing
+    # resolve_owner_id at the primary's owner_id instead of its own.
+    existing_user_cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "phone" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+    if "linked_owner_id" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN linked_owner_id INTEGER")
     conn.commit()
 
 
@@ -124,6 +134,33 @@ def set_user_name(conn, owner_id, name):
         (owner_id, name),
     )
     conn.commit()
+
+
+def resolve_owner_id(conn, sender_id):
+    """Telegram account -> shop identity used for all stock/sale/invoice data.
+    Most accounts map to themselves; one joined via link_account_by_phone
+    resolves to whichever account first registered that phone number, so a
+    shopkeeper's other Telegram accounts see the same shop's data."""
+    row = conn.execute("SELECT linked_owner_id FROM users WHERE owner_id = ?", (sender_id,)).fetchone()
+    return row[0] if row and row[0] else sender_id
+
+
+def link_account_by_phone(conn, sender_id, phone):
+    """"link <phone>": if some other account already registered this phone,
+    this account becomes an alias of it (returns its owner_id, True). Otherwise
+    this account registers the phone as its own, ready for a second/third
+    account to link to later (returns sender_id, False)."""
+    row = conn.execute(
+        "SELECT owner_id FROM users WHERE phone = ? AND owner_id != ?", (phone, sender_id)
+    ).fetchone()
+    if row:
+        target = row[0]
+        conn.execute("UPDATE users SET linked_owner_id = ? WHERE owner_id = ?", (target, sender_id))
+        conn.commit()
+        return target, True
+    conn.execute("UPDATE users SET phone = ? WHERE owner_id = ?", (phone, sender_id))
+    conn.commit()
+    return sender_id, False
 
 
 def find_supplier(conn, name):
